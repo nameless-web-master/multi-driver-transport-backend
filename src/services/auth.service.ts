@@ -1,0 +1,160 @@
+import { pool } from "../database";
+import { PublicUser, UserRow, toPublicUser } from "../models/user.model";
+import {
+  ForgotPasswordRequest,
+  LoginRequest,
+  RegisterRequest,
+  ResetPasswordRequest,
+} from "../schemas/auth.schema";
+import { hashPassword, verifyPassword } from "./password.service";
+import {
+  TokenPair,
+  consumePasswordResetToken,
+  issuePasswordResetToken,
+  issueTokenPair,
+  revokeAllUserRefreshTokens,
+  revokeRefreshToken,
+  validateRefreshToken,
+} from "./token.service";
+
+export class AuthError extends Error {
+  status: number;
+  constructor(message: string, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function rowToUser(row: Record<string, unknown>): UserRow {
+  return {
+    id: Number(row.id),
+    full_name: String(row.full_name),
+    company_name: String(row.company_name),
+    email: String(row.email),
+    hashed_password: String(row.hashed_password),
+    is_active: Boolean(row.is_active),
+    created_at: new Date(String(row.created_at)),
+    updated_at: new Date(String(row.updated_at)),
+  };
+}
+
+async function findUserByEmail(email: string): Promise<UserRow | null> {
+  const result = await pool.query(
+    `SELECT id, full_name, company_name, email, hashed_password, is_active, created_at, updated_at
+     FROM users
+     WHERE LOWER(email) = LOWER($1)`,
+    [email]
+  );
+  if (result.rowCount === 0) return null;
+  return rowToUser(result.rows[0]);
+}
+
+export async function getUserById(id: number): Promise<UserRow | null> {
+  const result = await pool.query(
+    `SELECT id, full_name, company_name, email, hashed_password, is_active, created_at, updated_at
+     FROM users
+     WHERE id = $1`,
+    [id]
+  );
+  if (result.rowCount === 0) return null;
+  return rowToUser(result.rows[0]);
+}
+
+export interface AuthResponse {
+  user: PublicUser;
+  tokens: TokenPair;
+}
+
+export async function registerUser(input: RegisterRequest): Promise<AuthResponse> {
+  const existing = await findUserByEmail(input.email);
+  if (existing) throw new AuthError("Email already in use", 409);
+
+  const hashed = await hashPassword(input.password);
+  const result = await pool.query(
+    `INSERT INTO users (full_name, company_name, email, hashed_password)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id, full_name, company_name, email, hashed_password, is_active, created_at, updated_at`,
+    [input.full_name, input.company_name, input.email, hashed]
+  );
+
+  const user = rowToUser(result.rows[0]);
+  const tokens = await issueTokenPair(user.id, user.email);
+  return { user: toPublicUser(user), tokens };
+}
+
+export async function loginUser(input: LoginRequest): Promise<AuthResponse> {
+  const user = await findUserByEmail(input.email);
+  if (!user) throw new AuthError("Invalid email or password", 401);
+  if (!user.is_active) throw new AuthError("Account is disabled", 403);
+
+  const ok = await verifyPassword(input.password, user.hashed_password);
+  if (!ok) throw new AuthError("Invalid email or password", 401);
+
+  const tokens = await issueTokenPair(user.id, user.email);
+  return { user: toPublicUser(user), tokens };
+}
+
+export async function refreshSession(refreshToken: string): Promise<TokenPair> {
+  let userId: number;
+  try {
+    userId = await validateRefreshToken(refreshToken);
+  } catch (err) {
+    throw new AuthError(err instanceof Error ? err.message : "Invalid refresh token", 401);
+  }
+
+  const user = await getUserById(userId);
+  if (!user || !user.is_active) throw new AuthError("Account not available", 401);
+
+  // Rotate: revoke the presented refresh token, then issue a fresh pair.
+  await revokeRefreshToken(refreshToken);
+  return issueTokenPair(user.id, user.email);
+}
+
+export async function logoutUser(refreshToken: string | undefined, userId: number | undefined): Promise<void> {
+  if (refreshToken) await revokeRefreshToken(refreshToken);
+  else if (userId) await revokeAllUserRefreshTokens(userId);
+}
+
+export interface ForgotPasswordResult {
+  message: string;
+  /**
+   * Only returned in non-production environments to ease local testing. When
+   * an email service is wired up this field disappears from responses.
+   */
+  reset_token?: string;
+}
+
+export async function forgotPassword(input: ForgotPasswordRequest): Promise<ForgotPasswordResult> {
+  const user = await findUserByEmail(input.email);
+  // Always return the same shape to avoid leaking which emails exist.
+  if (!user || !user.is_active) {
+    return { message: "If the email exists, a reset link has been sent." };
+  }
+
+  const { token } = await issuePasswordResetToken(user.id);
+  const result: ForgotPasswordResult = {
+    message: "If the email exists, a reset link has been sent.",
+  };
+  if (process.env.NODE_ENV !== "production") {
+    result.reset_token = token;
+  }
+  return result;
+}
+
+export async function resetPassword(input: ResetPasswordRequest): Promise<void> {
+  let userId: number;
+  try {
+    userId = await consumePasswordResetToken(input.token);
+  } catch (err) {
+    throw new AuthError(err instanceof Error ? err.message : "Invalid reset token", 400);
+  }
+
+  const hashed = await hashPassword(input.password);
+  await pool.query(
+    `UPDATE users SET hashed_password = $1, updated_at = NOW() WHERE id = $2`,
+    [hashed, userId]
+  );
+
+  // Invalidate every active session for this user.
+  await revokeAllUserRefreshTokens(userId);
+}

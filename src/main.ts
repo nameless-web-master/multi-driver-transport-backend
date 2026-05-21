@@ -1,0 +1,51 @@
+import express, { Request, Response, NextFunction } from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import { ensureSchema } from "./database";
+import { authRouter } from "./routes/auth.routes";
+import { dashboardRouter } from "./routes/dashboard.routes";
+import { h3Router } from "./routes/h3.routes";
+import { driverZonesRouter } from "./routes/driverZones.routes";
+
+dotenv.config();
+
+const app = express();
+const PORT = Number(process.env.PORT) || 4000;
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3000";
+
+app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
+app.use(express.json({ limit: "5mb" }));
+
+app.get("/api/health", (_req, res) => {
+  res.json({ status: "ok", service: "multi-driver-h3-backend", milestone: 2, auth: true });
+});
+
+app.use("/api/auth", authRouter);
+app.use("/api/dashboard", dashboardRouter);
+app.use("/api/h3", h3Router);
+app.use("/api/driver-zones", driverZonesRouter);
+
+// 404
+app.use((req, res) => {
+  res.status(404).json({ error: "Not Found", path: req.originalUrl });
+});
+
+// Centralized error handler.
+// Keeps the API response shape clean and predictable across all routes.
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  const message = err instanceof Error ? err.message : "Internal Server Error";
+  console.error("[error]", err);
+  res.status(500).json({ error: message });
+});
+
+async function bootstrap() {
+  await ensureSchema();
+  app.listen(PORT, () => {
+    console.log(`API ready on http://localhost:${PORT}`);
+  });
+}
+
+bootstrap().catch((err) => {
+  console.error("Failed to start server:", err);
+  process.exit(1);
+});
