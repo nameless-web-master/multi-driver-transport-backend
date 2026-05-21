@@ -11,9 +11,28 @@ dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT) || 4000;
-const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:3000";
 
-app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
+// Comma-separated list of allowed origins. Supports a single value or many,
+// and tolerates a trailing slash. Use "*" to allow all (not recommended with credentials).
+const allowedOrigins = (process.env.CORS_ORIGIN || "http://localhost:3000")
+  .split(",")
+  .map((o) => o.trim().replace(/\/$/, ""))
+  .filter(Boolean);
+
+const corsOptions: cors.CorsOptions = {
+  origin(origin, callback) {
+    // Allow same-origin / curl / server-to-server requests (no Origin header).
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes("*")) return callback(null, true);
+    const normalized = origin.replace(/\/$/, "");
+    if (allowedOrigins.includes(normalized)) return callback(null, true);
+    return callback(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "5mb" }));
 
 app.get("/api/health", (_req, res) => {
