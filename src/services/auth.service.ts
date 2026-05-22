@@ -1,5 +1,6 @@
 import { pool } from "../database";
 import { PublicUser, UserRow, toPublicUser } from "../models/user.model";
+import { normalizeRole, type UserRole } from "../models/userRole.model";
 import {
   ForgotPasswordRequest,
   LoginRequest,
@@ -25,13 +26,32 @@ export class AuthError extends Error {
   }
 }
 
-function rowToUser(row: Record<string, unknown>): UserRow {
+const USER_SELECT = `
+  SELECT id, full_name, company_name, email, hashed_password, role, phone, address,
+         lat, lng, trustworthiness, is_active, created_at, updated_at
+  FROM users
+`;
+
+function toNullableNumber(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+export function rowToUser(row: Record<string, unknown>): UserRow {
+  const role: UserRole = normalizeRole(row.role);
   return {
     id: Number(row.id),
     full_name: String(row.full_name),
-    company_name: String(row.company_name),
+    company_name: String(row.company_name ?? ""),
     email: String(row.email),
     hashed_password: String(row.hashed_password),
+    role,
+    phone: String(row.phone ?? ""),
+    address: String(row.address ?? ""),
+    lat: toNullableNumber(row.lat),
+    lng: toNullableNumber(row.lng),
+    trustworthiness: Number(row.trustworthiness ?? 0),
     is_active: Boolean(row.is_active),
     created_at: new Date(String(row.created_at)),
     updated_at: new Date(String(row.updated_at)),
@@ -40,9 +60,7 @@ function rowToUser(row: Record<string, unknown>): UserRow {
 
 async function findUserByEmail(email: string): Promise<UserRow | null> {
   const result = await pool.query(
-    `SELECT id, full_name, company_name, email, hashed_password, is_active, created_at, updated_at
-     FROM users
-     WHERE LOWER(email) = LOWER($1)`,
+    `${USER_SELECT} WHERE LOWER(email) = LOWER($1)`,
     [email]
   );
   if (result.rowCount === 0) return null;
@@ -50,12 +68,7 @@ async function findUserByEmail(email: string): Promise<UserRow | null> {
 }
 
 export async function getUserById(id: number): Promise<UserRow | null> {
-  const result = await pool.query(
-    `SELECT id, full_name, company_name, email, hashed_password, is_active, created_at, updated_at
-     FROM users
-     WHERE id = $1`,
-    [id]
-  );
+  const result = await pool.query(`${USER_SELECT} WHERE id = $1`, [id]);
   if (result.rowCount === 0) return null;
   return rowToUser(result.rows[0]);
 }
@@ -70,11 +83,21 @@ export async function registerUser(input: RegisterRequest): Promise<AuthResponse
   if (existing) throw new AuthError("Email already in use", 409);
 
   const hashed = await hashPassword(input.password);
+  const adminEmail = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+  const role: UserRole =
+    adminEmail && input.email.trim().toLowerCase() === adminEmail ? "admin" : input.role;
+
+  const companyName = role === "driver" ? input.company_name.trim() : "";
+  const address = input.address?.trim() ?? "";
+  const lat = typeof input.lat === "number" ? input.lat : null;
+  const lng = typeof input.lng === "number" ? input.lng : null;
+
   const result = await pool.query(
-    `INSERT INTO users (full_name, company_name, email, hashed_password)
-     VALUES ($1, $2, $3, $4)
-     RETURNING id, full_name, company_name, email, hashed_password, is_active, created_at, updated_at`,
-    [input.full_name, input.company_name, input.email, hashed]
+    `INSERT INTO users (full_name, company_name, email, hashed_password, role, phone, address, lat, lng)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     RETURNING id, full_name, company_name, email, hashed_password, role, phone, address,
+               lat, lng, trustworthiness, is_active, created_at, updated_at`,
+    [input.full_name, companyName, input.email, hashed, role, input.phone, address, lat, lng]
   );
 
   const user = rowToUser(result.rows[0]);
@@ -105,7 +128,6 @@ export async function refreshSession(refreshToken: string): Promise<TokenPair> {
   const user = await getUserById(userId);
   if (!user || !user.is_active) throw new AuthError("Account not available", 401);
 
-  // Rotate: revoke the presented refresh token, then issue a fresh pair.
   await revokeRefreshToken(refreshToken);
   return issueTokenPair(user.id, user.email);
 }
@@ -126,7 +148,6 @@ export interface ForgotPasswordResult {
 
 export async function forgotPassword(input: ForgotPasswordRequest): Promise<ForgotPasswordResult> {
   const user = await findUserByEmail(input.email);
-  // Always return the same shape to avoid leaking which emails exist.
   if (!user || !user.is_active) {
     return { message: "If the email exists, a reset link has been sent." };
   }
@@ -155,6 +176,5 @@ export async function resetPassword(input: ResetPasswordRequest): Promise<void> 
     [hashed, userId]
   );
 
-  // Invalidate every active session for this user.
   await revokeAllUserRefreshTokens(userId);
 }

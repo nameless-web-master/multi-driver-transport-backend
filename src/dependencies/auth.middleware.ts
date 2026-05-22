@@ -1,11 +1,13 @@
 import { NextFunction, Request, Response } from "express";
 import { PublicUser, toPublicUser } from "../models/user.model";
+import type { UserRole } from "../models/userRole.model";
 import { getUserById } from "../services/auth.service";
 import { verifyAccessToken } from "../services/token.service";
 
 export interface AuthenticatedRequest extends Request {
   user?: PublicUser;
   userId?: number;
+  userRole?: UserRole;
 }
 
 /**
@@ -42,8 +44,21 @@ export async function requireAuth(
     }
     req.user = toPublicUser(user);
     req.userId = user.id;
+    req.userRole = user.role;
     next();
   } catch {
     res.status(401).json({ error: "Invalid or expired token" });
   }
+}
+
+export function requireAdmin(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): void {
+  if (req.userRole !== "admin") {
+    res.status(403).json({ error: "Admin access required" });
+    return;
+  }
+  next();
 }

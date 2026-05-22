@@ -1,7 +1,8 @@
 import { Router, Request, Response } from "express";
 import { requireAuth } from "../dependencies/auth.middleware";
 import { convertRequestSchema, ConvertResponse } from "../schemas/h3.schema";
-import { cellCenter, H3Resolution, pointToCell } from "../services/h3_service";
+import { polygonToCellsSchema } from "../schemas/h3Polygon.schema";
+import { cellCenter, H3Resolution, pointToCell, polygonCells } from "../services/h3_service";
 
 export const h3Router = Router();
 
@@ -34,6 +35,30 @@ h3Router.post("/convert", (req: Request, res: Response) => {
     return res.json(body);
   } catch (err) {
     const message = err instanceof Error ? err.message : "H3 conversion failed";
+    return res.status(400).json({ error: message });
+  }
+});
+
+h3Router.post("/polygon-to-cells", (req: Request, res: Response) => {
+  const parsed = polygonToCellsSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Validation failed",
+      details: parsed.error.flatten().fieldErrors,
+    });
+  }
+
+  const { boundary, resolution } = parsed.data;
+  try {
+    const h3Resolution = resolution as H3Resolution;
+    const cells = polygonCells(boundary, h3Resolution);
+    return res.json({
+      h3_cells: cells,
+      cell_count: cells.length,
+      resolution,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Polygon conversion failed";
     return res.status(400).json({ error: message });
   }
 });

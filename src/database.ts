@@ -1,5 +1,6 @@
 import { Pool, PoolConfig } from "pg";
 import dotenv from "dotenv";
+import { CURRENCIES } from "./models/currency.model";
 
 dotenv.config();
 
@@ -26,10 +27,34 @@ function resolveSsl(): PoolConfig["ssl"] | undefined {
 
 function buildPoolConfig(): PoolConfig {
   const ssl = resolveSsl();
+
+  /**
+   * Performance/stability tuning notes:
+   * - keepAlive: sends TCP keep-alive probes so NAT / managed providers
+   *   (Render free tier, Heroku, etc.) don't silently drop idle sockets.
+   * - keepAliveInitialDelayMillis: start probing well before the typical
+   *   ~5-minute idle kill window on Render.
+   * - idleTimeoutMillis: recycle pool clients ourselves *before* the
+   *   server kills them, so we don't hand out half-dead sockets.
+   * - connectionTimeoutMillis: bound how long a single connect attempt
+   *   can hang on a slow / unreachable remote DB.
+   * - statement_timeout: prevent a single runaway query from holding a
+   *   client forever.
+   */
+  const shared: Partial<PoolConfig> = {
+    max: Number(process.env.PG_POOL_MAX) || 5,
+    idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS) || 30_000,
+    connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS) || 10_000,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
+    statement_timeout: Number(process.env.PG_STATEMENT_TIMEOUT_MS) || 15_000,
+  };
+
   if (process.env.DATABASE_URL) {
-    return { connectionString: process.env.DATABASE_URL, ssl };
+    return { ...shared, connectionString: process.env.DATABASE_URL, ssl };
   }
   return {
+    ...shared,
     host: process.env.PGHOST || "localhost",
     port: Number(process.env.PGPORT) || 5432,
     user: process.env.PGUSER || "postgres",
@@ -41,71 +66,116 @@ function buildPoolConfig(): PoolConfig {
 
 export const pool = new Pool(buildPoolConfig());
 
+/**
+ * pg emits a pool-level `error` event when an *idle* client throws (typical
+ * symptom on Render free tier: `Connection terminated unexpectedly`). If we
+ * don't attach a listener the process can crash. Logging it lets the pool
+ * silently evict the dead client and create a fresh one on the next acquire.
+ */
 pool.on("error", (err) => {
-  console.error("Unexpected PG pool error:", err);
+  console.error("[pg] idle client error (dropping client):", err.message);
 });
 
 /**
  * Idempotent schema bootstrap.
  *
- * h3_cells is stored as JSONB so that future milestones (overlap detection,
- * adjacency graph, multi-driver path generation) can query/index individual
- * H3 indexes efficiently with GIN indexes.
+ * Supports three primary roles: driver, sender, receiver (plus admin).
+ * Drivers create zones (H3 cells / geofences) with per-zone cost and
+ * settings. Senders create orders that target a receiver and travel
+ * through driver zones.
  */
 export async function ensureSchema(): Promise<void> {
   const client = await pool.connect();
   try {
     await client.query(`
-      CREATE TABLE IF NOT EXISTS driver_zones (
-        id           SERIAL PRIMARY KEY,
-        driver_name  TEXT      NOT NULL,
-        zone_name    TEXT      NOT NULL,
-        resolution   INTEGER   NOT NULL CHECK (resolution BETWEEN 0 AND 15),
-        h3_cells     JSONB     NOT NULL DEFAULT '[]'::jsonb,
-        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
-
-    // GIN index enables fast overlap / containment queries in Milestone 2+.
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_driver_zones_h3_cells
-      ON driver_zones USING GIN (h3_cells);
-    `);
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_driver_zones_resolution
-      ON driver_zones (resolution);
-    `);
-
-    /**
-     * Auth tables.
-     *
-     * users: canonical account record. `hashed_password` stores a bcrypt hash;
-     *   plaintext is never persisted. `is_active` lets future milestones disable
-     *   accounts without deletion.
-     * refresh_tokens: opaque refresh-token rotation store. Tokens are SHA-256
-     *   hashed before storage so a DB compromise cannot mint sessions.
-     * password_reset_tokens: short-lived bcrypt-hashed reset tokens. Structure
-     *   is ready for email delivery in a later milestone.
-     */
-    await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         id              SERIAL PRIMARY KEY,
         full_name       TEXT        NOT NULL,
-        company_name    TEXT        NOT NULL,
+        company_name    TEXT        NOT NULL DEFAULT '',
         email           TEXT        NOT NULL UNIQUE,
         hashed_password TEXT        NOT NULL,
+        role            TEXT        NOT NULL DEFAULT 'sender',
+        phone           TEXT        NOT NULL DEFAULT '',
+        address         TEXT        NOT NULL DEFAULT '',
+        lat             DOUBLE PRECISION,
+        lng             DOUBLE PRECISION,
+        trustworthiness INTEGER     NOT NULL DEFAULT 0,
         is_active       BOOLEAN     NOT NULL DEFAULT TRUE,
         created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
 
+    // Backfill columns on existing installs.
+    await client.query(`ALTER TABLE users ALTER COLUMN company_name DROP NOT NULL;`).catch(() => undefined);
+    await client.query(`ALTER TABLE users ALTER COLUMN company_name SET DEFAULT '';`);
+    await client.query(`UPDATE users SET company_name = '' WHERE company_name IS NULL;`);
+    await client.query(`ALTER TABLE users ALTER COLUMN company_name SET NOT NULL;`);
+
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT NOT NULL DEFAULT '';`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS address TEXT NOT NULL DEFAULT '';`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION;`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS lng DOUBLE PRECISION;`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS trustworthiness INTEGER NOT NULL DEFAULT 0;`);
+
+    // Refresh the role check constraint to cover the new roles.
+    await client.query(`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;`);
+    await client.query(`
+      ALTER TABLE users
+        ADD CONSTRAINT users_role_check
+        CHECK (role IN ('admin', 'driver', 'sender', 'receiver', 'user'));
+    `);
+
     await client.query(`
       CREATE INDEX IF NOT EXISTS idx_users_email_lower
       ON users (LOWER(email));
     `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_role ON users (role);`);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS driver_zones (
+        id                       SERIAL PRIMARY KEY,
+        owner_user_id            INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        driver_name              TEXT        NOT NULL,
+        zone_name                TEXT        NOT NULL,
+        resolution               INTEGER     NOT NULL CHECK (resolution BETWEEN 0 AND 15),
+        h3_cells                 JSONB       NOT NULL DEFAULT '[]'::jsonb,
+        transport_modes          TEXT[]      NOT NULL DEFAULT '{}',
+        transport_mode           TEXT,
+        boundary                 JSONB,
+        rate_cost                NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        currency                 TEXT        NOT NULL DEFAULT 'USD',
+        available                BOOLEAN     NOT NULL DEFAULT TRUE,
+        trust_payment_forwarder  BOOLEAN     NOT NULL DEFAULT FALSE,
+        created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS owner_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS transport_modes TEXT[] NOT NULL DEFAULT '{}';`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS transport_mode TEXT;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS boundary JSONB;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS rate_cost NUMERIC(12, 2) NOT NULL DEFAULT 0;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'USD';`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS available BOOLEAN NOT NULL DEFAULT TRUE;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS trust_payment_forwarder BOOLEAN NOT NULL DEFAULT FALSE;`);
+    // Drop and rebuild the currency CHECK each boot so adding a code to
+    // `CURRENCIES` automatically widens the allowed set without a manual
+    // migration. The IN list is derived from the same constant the API uses.
+    await client.query(`ALTER TABLE driver_zones DROP CONSTRAINT IF EXISTS driver_zones_currency_check;`);
+    const currencyList = CURRENCIES.map((c) => `'${c}'`).join(", ");
+    await client.query(
+      `ALTER TABLE driver_zones
+         ADD CONSTRAINT driver_zones_currency_check CHECK (currency IN (${currencyList}));`
+    );
+    // Backfill transport_mode from the existing array, defaulting to 'land'.
+    await client.query(`UPDATE driver_zones SET transport_mode = COALESCE(transport_mode, transport_modes[1], 'land') WHERE transport_mode IS NULL OR transport_mode = '';`);
+
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_driver_zones_owner_user_id ON driver_zones (owner_user_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_driver_zones_h3_cells ON driver_zones USING GIN (h3_cells);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_driver_zones_resolution ON driver_zones (resolution);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_driver_zones_available ON driver_zones (available);`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS refresh_tokens (
@@ -118,10 +188,7 @@ export async function ensureSchema(): Promise<void> {
       );
     `);
 
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id
-      ON refresh_tokens (user_id);
-    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens (user_id);`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS password_reset_tokens (
@@ -133,11 +200,46 @@ export async function ensureSchema(): Promise<void> {
         created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
     `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_id ON password_reset_tokens (user_id);`);
 
+    // Followers (sender / receiver follow drivers; each follow bumps trustworthiness).
     await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_id
-      ON password_reset_tokens (user_id);
+      CREATE TABLE IF NOT EXISTS follows (
+        follower_user_id INTEGER     NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        driver_user_id   INTEGER     NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (follower_user_id, driver_user_id)
+      );
     `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_follows_driver_user_id ON follows (driver_user_id);`);
+
+    // Orders (sender -> receiver, optionally fulfilled by a driver).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id                  SERIAL PRIMARY KEY,
+        sender_user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        receiver_user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+        driver_user_id      INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        sender_address      TEXT    NOT NULL DEFAULT '',
+        sender_lat          DOUBLE PRECISION,
+        sender_lng          DOUBLE PRECISION,
+        destination_address TEXT    NOT NULL DEFAULT '',
+        destination_lat     DOUBLE PRECISION,
+        destination_lng     DOUBLE PRECISION,
+        receiver_phone      TEXT    NOT NULL DEFAULT '',
+        notes               TEXT    NOT NULL DEFAULT '',
+        status              TEXT    NOT NULL DEFAULT 'submitted',
+        submitted_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        delivering_at       TIMESTAMPTZ,
+        received_at         TIMESTAMPTZ,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT orders_status_check CHECK (status IN ('submitted', 'delivering', 'received'))
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_sender_user_id ON orders (sender_user_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_receiver_user_id ON orders (receiver_user_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_driver_user_id ON orders (driver_user_id);`);
 
     console.log("[db] schema ready");
   } finally {

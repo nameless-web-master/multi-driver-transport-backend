@@ -6,6 +6,8 @@ import { authRouter } from "./routes/auth.routes";
 import { dashboardRouter } from "./routes/dashboard.routes";
 import { h3Router } from "./routes/h3.routes";
 import { driverZonesRouter } from "./routes/driverZones.routes";
+import { ordersRouter } from "./routes/orders.routes";
+import { usersRouter } from "./routes/users.routes";
 
 dotenv.config();
 
@@ -43,6 +45,8 @@ app.use("/api/auth", authRouter);
 app.use("/api/dashboard", dashboardRouter);
 app.use("/api/h3", h3Router);
 app.use("/api/driver-zones", driverZonesRouter);
+app.use("/api/orders", ordersRouter);
+app.use("/api/users", usersRouter);
 
 // 404
 app.use((req, res) => {
