@@ -241,6 +241,44 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_receiver_user_id ON orders (receiver_user_id);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_driver_user_id ON orders (driver_user_id);`);
 
+    // ----------------------------------------------------------------------
+    // Milestone 2: zone overlap / adjacency graph.
+    //
+    // Each row represents one undirected connection between two driver zones
+    // (zone_a_id < zone_b_id by convention to prevent A-B/B-A duplicates).
+    // `connection_type` is "overlap" when the zones share H3 cells,
+    // "adjacent" when they don't share cells but at least one cell pair
+    // are direct neighbours. transfer_cells holds the shared H3 cells for
+    // overlaps (or representative cells for adjacency).
+    // adjacent_cell_pairs is the full list of touching boundary pairs.
+    // ----------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS zone_connections (
+        id                   SERIAL PRIMARY KEY,
+        zone_a_id            INTEGER NOT NULL REFERENCES driver_zones(id) ON DELETE CASCADE,
+        zone_b_id            INTEGER NOT NULL REFERENCES driver_zones(id) ON DELETE CASCADE,
+        transport_a_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        transport_b_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        connection_type      TEXT    NOT NULL,
+        transfer_cells       JSONB   NOT NULL DEFAULT '[]'::jsonb,
+        adjacent_cell_pairs  JSONB,
+        transport_method_a   TEXT,
+        transport_method_b   TEXT,
+        is_active            BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT zone_connections_no_self CHECK (zone_a_id <> zone_b_id),
+        CONSTRAINT zone_connections_type_check CHECK (connection_type IN ('overlap', 'adjacent')),
+        CONSTRAINT zone_connections_unique UNIQUE (zone_a_id, zone_b_id)
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_zc_zone_a ON zone_connections (zone_a_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_zc_zone_b ON zone_connections (zone_b_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_zc_transport_a ON zone_connections (transport_a_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_zc_transport_b ON zone_connections (transport_b_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_zc_is_active ON zone_connections (is_active);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_zc_type ON zone_connections (connection_type);`);
+
     console.log("[db] schema ready");
   } finally {
     client.release();

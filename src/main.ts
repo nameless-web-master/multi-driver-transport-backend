@@ -8,6 +8,10 @@ import { h3Router } from "./routes/h3.routes";
 import { driverZonesRouter } from "./routes/driverZones.routes";
 import { ordersRouter } from "./routes/orders.routes";
 import { usersRouter } from "./routes/users.routes";
+import {
+  zoneConnectionsRouter,
+  zonesScopedConnectionsRouter,
+} from "./routes/zoneConnections.routes";
 
 dotenv.config();
 
@@ -38,7 +42,13 @@ app.options("*", cors(corsOptions));
 app.use(express.json({ limit: "5mb" }));
 
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", service: "multi-driver-h3-backend", milestone: 2, auth: true });
+  res.json({
+    status: "ok",
+    service: "multi-driver-h3-backend",
+    milestone: 2,
+    auth: true,
+    features: ["zones", "orders", "follows", "zone-connections"],
+  });
 });
 
 app.use("/api/auth", authRouter);
@@ -47,6 +57,10 @@ app.use("/api/h3", h3Router);
 app.use("/api/driver-zones", driverZonesRouter);
 app.use("/api/orders", ordersRouter);
 app.use("/api/users", usersRouter);
+app.use("/api/zone-connections", zoneConnectionsRouter);
+// Spec wants the per-zone helpers exposed under /api/zones/:id/... — we
+// mount them on a separate scoped router so the matching is precise.
+app.use("/api/zones", zonesScopedConnectionsRouter);
 
 // 404
 app.use((req, res) => {

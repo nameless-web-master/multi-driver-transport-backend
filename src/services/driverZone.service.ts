@@ -15,6 +15,10 @@ import {
 } from "../schemas/driverZone.schema";
 import { cellResolution, polygonCells, sanitizeCells } from "./h3_service";
 import type { H3Resolution } from "./h3_service";
+import {
+  deactivateConnectionsForZone,
+  recalculateConnectionsForZone,
+} from "./zoneConnection.service";
 
 const ZONE_SELECT = `
   SELECT z.id, z.owner_user_id, z.driver_name, z.zone_name, z.resolution, z.h3_cells,
@@ -237,6 +241,13 @@ export async function createDriverZone(
   const id = Number(result.rows[0].id);
   const created = await getDriverZoneById(id, { userId: input.owner_user_id, role: "driver" });
   if (!created) throw new Error("Failed to load freshly created zone");
+
+  // Refresh the M2 zone-connection graph in the background. Best-effort:
+  // failure here should not roll back the zone creation.
+  recalculateConnectionsForZone(id).catch((err) =>
+    console.error("[zone-connections] recalc after create failed:", err)
+  );
+
   return created;
 }
 
@@ -328,6 +339,13 @@ export async function updateDriverZone(
   );
 
   if (result.rowCount === 0) return null;
+
+  // Geometry / availability may have changed — refresh connections for
+  // this zone only (cheap incremental update, runs in the background).
+  recalculateConnectionsForZone(id).catch((err) =>
+    console.error("[zone-connections] recalc after update failed:", err)
+  );
+
   return getDriverZoneById(id, ctx);
 }
 
@@ -353,6 +371,13 @@ export async function updateDriverZoneFromRequest(
 export async function deleteDriverZone(id: number, ctx: ZoneAccessContext): Promise<boolean> {
   const existing = await getDriverZoneById(id, ctx);
   if (!existing) return false;
+
+  // Drop connections first so the recalc/visibility view never lags behind
+  // the actual deletion (ON DELETE CASCADE would also catch them, but
+  // doing it explicitly keeps callers race-free).
+  await deactivateConnectionsForZone(id).catch((err) =>
+    console.error("[zone-connections] cleanup before delete failed:", err)
+  );
 
   if (ctx.role === "admin") {
     const result = await pool.query(`DELETE FROM driver_zones WHERE id = $1`, [id]);
