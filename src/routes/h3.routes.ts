@@ -2,7 +2,8 @@ import { Router, Request, Response } from "express";
 import { requireAuth } from "../dependencies/auth.middleware";
 import { convertRequestSchema, ConvertResponse } from "../schemas/h3.schema";
 import { polygonToCellsSchema } from "../schemas/h3Polygon.schema";
-import { cellCenter, H3Resolution, pointToCell, polygonCells } from "../services/h3_service";
+import { cellCenter, H3Resolution, pointToCell } from "../services/h3_service";
+import { hierarchicalPolygonCells } from "../services/hierarchicalFill";
 
 export const h3Router = Router();
 
@@ -51,11 +52,16 @@ h3Router.post("/polygon-to-cells", (req: Request, res: Response) => {
   const { boundary, resolution } = parsed.data;
   try {
     const h3Resolution = resolution as H3Resolution;
-    const cells = polygonCells(boundary, h3Resolution);
+    const result = hierarchicalPolygonCells(boundary, {
+      maxRes: h3Resolution,
+      maxCells: 8000,
+    });
     return res.json({
-      h3_cells: cells,
-      cell_count: cells.length,
-      resolution,
+      h3_cells: result.cells,
+      cell_count: result.cellCount,
+      resolution: result.maxResolution,
+      min_resolution: result.minResolution,
+      max_resolution: result.maxResolution,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Polygon conversion failed";
