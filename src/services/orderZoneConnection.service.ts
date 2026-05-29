@@ -1,0 +1,579 @@
+import { latLngToCell } from "h3-js";
+import { pool } from "../database";
+import type { AdjacentCellPair, ConnectionType } from "../models/zoneConnection.model";
+
+/**
+ * Milestone 2 — Order draft preview.
+ *
+ * Given the sender's pickup coordinates and the receiver's drop-off
+ * coordinates (both pre-submit, no order row yet), project the persisted
+ * `zone_connections` graph down to the slice that is relevant to this
+ * order: pickup-covering zones, destination-covering zones, and any chain
+ * of overlap/adjacency that links the two sides.
+ *
+ * Strictly a preview — no driver assignment, no route generation. The UI
+ * labels everything as "preview / not a final route".
+ */
+
+/** Default H3 resolution for the *display* pickup / drop-off cells. */
+export const ORDER_H3_RESOLUTION = 8;
+
+/** Default BFS depth limit when walking the zone-connection graph. */
+export const DEFAULT_PREVIEW_MAX_DEPTH = 6;
+
+export type OrderConnectionStatus =
+  | "connected"
+  | "not_connected"
+  | "no_pickup_zone"
+  | "no_destination_zone";
+
+export interface OrderDraftPreviewInput {
+  source_lat: number;
+  source_lng: number;
+  destination_lat: number;
+  destination_lng: number;
+  source_name?: string;
+  source_address?: string;
+  destination_name?: string;
+  destination_address?: string;
+  /** BFS depth limit. Clamped to 1..20. */
+  max_depth?: number;
+}
+
+export interface OrderDraftZoneSummary {
+  zone_id: number;
+  zone_name: string;
+  transport_id: number;
+  transport_name: string;
+  transport_method: string | null;
+  cell_count: number;
+  resolution: number;
+  /**
+   * H3 cells for the zone, sampled down to `MAX_CELLS_PER_PREVIEW_ZONE` for
+   * map rendering. The full set stays in the database — we only ship a
+   * representative slice so the map can outline the zone without DOM-melting
+   * geofence-derived zones with tens of thousands of cells.
+   */
+  cells: string[];
+  is_pickup: boolean;
+  is_destination: boolean;
+  /** BFS depth from the nearest pickup zone (0 = pickup). null if unreached. */
+  depth: number | null;
+}
+
+export interface OrderDraftConnection {
+  id: number;
+  from_zone_id: number;
+  to_zone_id: number;
+  connection_type: ConnectionType;
+  transfer_cells: string[];
+  adjacent_cell_pairs: AdjacentCellPair[];
+  used_in_preview: boolean;
+}
+
+export interface OrderDraftChain {
+  zone_ids: number[];
+  connection_ids: number[];
+  hops: number;
+}
+
+export interface OrderDraftPreview {
+  source: {
+    name: string;
+    address: string;
+    lat: number;
+    lng: number;
+    h3: string;
+  };
+  destination: {
+    name: string;
+    address: string;
+    lat: number;
+    lng: number;
+    h3: string;
+  };
+  preview_resolution: number;
+  max_depth: number;
+  pickup_zones: OrderDraftZoneSummary[];
+  destination_zones: OrderDraftZoneSummary[];
+  connected_zones: OrderDraftZoneSummary[];
+  connections: OrderDraftConnection[];
+  transfer_cells: string[];
+  is_connected_to_destination: boolean;
+  status: OrderConnectionStatus;
+  message: string;
+  possible_connection_chains: OrderDraftChain[];
+}
+
+// --------------------------------------------------------------------------
+// Internal helpers
+// --------------------------------------------------------------------------
+
+/**
+ * Lightweight zone metadata. Crucially we do NOT pull `h3_cells` into Node:
+ * geofence zones can have tens of thousands of cells and pulling them all
+ * via `SELECT z.h3_cells` makes the preview endpoint feel "stuck" even when
+ * it's only doing a handful of zones. Membership is pushed down to SQL
+ * (see `findCoveringZoneIdsSql`) which leans on the GIN index that already
+ * exists on `driver_zones.h3_cells`.
+ */
+interface ZoneMeta {
+  id: number;
+  zone_name: string;
+  owner_user_id: number;
+  transport_name: string;
+  transport_mode: string | null;
+  resolution: number;
+  cell_count: number;
+}
+
+interface ConnectionRow {
+  id: number;
+  zone_a_id: number;
+  zone_b_id: number;
+  connection_type: ConnectionType;
+  transfer_cells: string[];
+  adjacent_cell_pairs: AdjacentCellPair[];
+}
+
+function parseCellsJsonb(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.map(String).map((c) => c.toLowerCase());
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed)
+        ? parsed.map(String).map((c) => c.toLowerCase())
+        : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function parsePairsJsonb(raw: unknown): AdjacentCellPair[] {
+  if (raw == null) return [];
+  if (Array.isArray(raw)) {
+    return raw
+      .filter((p): p is { from_cell: unknown; to_cell: unknown } =>
+        Boolean(p && typeof p === "object" && "from_cell" in p && "to_cell" in p)
+      )
+      .map((p) => ({ from_cell: String(p.from_cell), to_cell: String(p.to_cell) }));
+  }
+  if (typeof raw === "string") {
+    try {
+      return parsePairsJsonb(JSON.parse(raw));
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+async function loadZoneMeta(): Promise<ZoneMeta[]> {
+  // Note: `h3_cells` is intentionally NOT selected here — see ZoneMeta doc.
+  const result = await pool.query(
+    `SELECT z.id,
+            z.zone_name,
+            z.owner_user_id,
+            z.transport_mode,
+            z.resolution,
+            jsonb_array_length(z.h3_cells) AS cell_count,
+            u.full_name AS transport_name
+     FROM driver_zones z
+     JOIN users u ON u.id = z.owner_user_id
+     WHERE z.available = TRUE`
+  );
+  return result.rows.map((row) => ({
+    id: Number(row.id),
+    zone_name: String(row.zone_name ?? ""),
+    owner_user_id: Number(row.owner_user_id),
+    transport_name: String(row.transport_name ?? ""),
+    transport_mode: row.transport_mode == null ? null : String(row.transport_mode),
+    resolution: Number(row.resolution ?? 0),
+    cell_count: Number(row.cell_count ?? 0),
+  }));
+}
+
+/**
+ * Find which available zones cover (lat, lng) by pushing membership into SQL.
+ *
+ * H3 cells encode their resolution, so a candidate cell computed at res N can
+ * only ever match a zone whose `h3_cells` JSONB array stores res-N cells.
+ * That means we can hand SQL the set of candidates {res 0..15} and rely on
+ * `?|` (jsonb-has-any-of-keys) + the existing GIN index to return only the
+ * zones that actually contain the point — no JSON arrays travel to Node.
+ */
+async function findCoveringZoneIdsSql(lat: number, lng: number): Promise<Set<number>> {
+  const candidates: string[] = [];
+  for (let r = 0; r <= 15; r++) {
+    try {
+      candidates.push(latLngToCell(lat, lng, r).toLowerCase());
+    } catch {
+      // skip res that h3-js rejects for this point (shouldn't happen)
+    }
+  }
+  if (candidates.length === 0) return new Set();
+  const result = await pool.query(
+    `SELECT z.id
+     FROM driver_zones z
+     WHERE z.available = TRUE
+       AND z.h3_cells ?| $1::text[]`,
+    [candidates]
+  );
+  return new Set(result.rows.map((r) => Number(r.id)));
+}
+
+async function loadConnections(): Promise<ConnectionRow[]> {
+  const result = await pool.query(
+    `SELECT id, zone_a_id, zone_b_id, connection_type,
+            transfer_cells, adjacent_cell_pairs
+     FROM zone_connections
+     WHERE is_active = TRUE`
+  );
+  return result.rows.map((row) => ({
+    id: Number(row.id),
+    zone_a_id: Number(row.zone_a_id),
+    zone_b_id: Number(row.zone_b_id),
+    connection_type: row.connection_type as ConnectionType,
+    transfer_cells: parseCellsJsonb(row.transfer_cells),
+    adjacent_cell_pairs: parsePairsJsonb(row.adjacent_cell_pairs),
+  }));
+}
+
+function pickZones(ids: Set<number>, byId: Map<number, ZoneMeta>): ZoneMeta[] {
+  const out: ZoneMeta[] = [];
+  ids.forEach((id) => {
+    const z = byId.get(id);
+    if (z) out.push(z);
+  });
+  return out;
+}
+
+/**
+ * Cap on cells we ship per preview-relevant zone.
+ *
+ * The user wants to see the *full* origin zones on the preview map (e.g.
+ * "Driver A and Driver B's zones with the overlapped part highlighted"),
+ * not a thinned-out sample, so we set this to a deliberately generous
+ * value. Most driver-drawn zones have tens to hundreds of cells; even
+ * mid-sized geofence zones at res 8/9 fit comfortably under 5000.
+ *
+ * Pathologically large geofence zones (>5000 cells) still get sampled —
+ * Leaflet would otherwise render tens of thousands of <Polygon> elements
+ * and freeze the browser. For those edge cases a future enhancement can
+ * fall back to drawing just the zone's stored polygon `boundary`.
+ */
+const MAX_CELLS_PER_PREVIEW_ZONE = 5000;
+
+function sampleEvenly(arr: readonly string[], max: number): string[] {
+  if (arr.length <= max) return [...arr];
+  const out: string[] = [];
+  const step = arr.length / max;
+  for (let i = 0; i < max; i++) out.push(arr[Math.floor(i * step)]);
+  return out;
+}
+
+/**
+ * Load `h3_cells` ONLY for the zones we are about to surface in the
+ * preview (pickup-covering, destination-covering, BFS-reached). For the
+ * common 2..10 relevant zones this is a single targeted query — much
+ * cheaper than pulling cells for every available zone.
+ */
+async function loadCellsForZoneIds(ids: number[]): Promise<Map<number, string[]>> {
+  if (ids.length === 0) return new Map();
+  const result = await pool.query(
+    `SELECT id, h3_cells FROM driver_zones WHERE id = ANY($1::int[])`,
+    [ids]
+  );
+  const out = new Map<number, string[]>();
+  for (const row of result.rows) {
+    const cells = parseCellsJsonb(row.h3_cells);
+    out.set(Number(row.id), sampleEvenly(cells, MAX_CELLS_PER_PREVIEW_ZONE));
+  }
+  return out;
+}
+
+interface BfsState {
+  depth: Map<number, number>;
+  parent: Map<number, number>;
+  parentEdge: Map<number, number>;
+  usedConnectionIds: Set<number>;
+}
+
+function bfsFromPickup(
+  pickupZoneIds: number[],
+  adjacency: Map<number, { neighbour: number; connection: ConnectionRow }[]>,
+  maxDepth: number
+): BfsState {
+  const depth = new Map<number, number>();
+  const parent = new Map<number, number>();
+  const parentEdge = new Map<number, number>();
+  const usedConnectionIds = new Set<number>();
+
+  const queue: number[] = [];
+  for (const id of pickupZoneIds) {
+    if (!depth.has(id)) {
+      depth.set(id, 0);
+      queue.push(id);
+    }
+  }
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const currentDepth = depth.get(current) ?? 0;
+    if (currentDepth >= maxDepth) continue;
+    const edges = adjacency.get(current) ?? [];
+    for (const { neighbour, connection } of edges) {
+      if (depth.has(neighbour)) continue;
+      depth.set(neighbour, currentDepth + 1);
+      parent.set(neighbour, current);
+      parentEdge.set(neighbour, connection.id);
+      usedConnectionIds.add(connection.id);
+      queue.push(neighbour);
+    }
+  }
+  return { depth, parent, parentEdge, usedConnectionIds };
+}
+
+function reconstructChains(
+  reachedDestinationIds: number[],
+  bfs: BfsState
+): OrderDraftChain[] {
+  const MAX_CHAINS = 6;
+  const chains: OrderDraftChain[] = [];
+  for (const destId of reachedDestinationIds) {
+    if (!bfs.depth.has(destId)) continue;
+    const zoneIds: number[] = [destId];
+    const connectionIds: number[] = [];
+    let cursor: number | undefined = destId;
+    while (cursor != null && bfs.parent.has(cursor)) {
+      const parentZone: number = bfs.parent.get(cursor)!;
+      const edgeId = bfs.parentEdge.get(cursor);
+      if (edgeId != null) connectionIds.unshift(edgeId);
+      zoneIds.unshift(parentZone);
+      cursor = parentZone;
+    }
+    chains.push({ zone_ids: zoneIds, connection_ids: connectionIds, hops: connectionIds.length });
+    if (chains.length >= MAX_CHAINS) break;
+  }
+  chains.sort((a, b) => a.hops - b.hops);
+  return chains;
+}
+
+function describeStatus(
+  pickupCount: number,
+  destinationCount: number,
+  isConnected: boolean,
+  connectedCount: number
+): { status: OrderConnectionStatus; message: string } {
+  if (pickupCount === 0) {
+    return {
+      status: "no_pickup_zone",
+      message:
+        "No transport zone covers the pickup location. A driver needs to add a zone over the sender's location first.",
+    };
+  }
+  if (destinationCount === 0) {
+    return {
+      status: "no_destination_zone",
+      message:
+        "No transport zone covers the destination location. A driver needs to add a zone over the receiver's location first.",
+    };
+  }
+  if (isConnected) {
+    return {
+      status: "connected",
+      message: `Pickup and destination are linked through ${connectedCount} transport zone${
+        connectedCount === 1 ? "" : "s"
+      } via overlap or adjacency.`,
+    };
+  }
+  return {
+    status: "not_connected",
+    message:
+      "Pickup and destination zones exist but are not connected on the current zone graph. The order can still be created — it just has no end-to-end zone path yet.",
+  };
+}
+
+function zoneMetaToSummary(
+  z: ZoneMeta,
+  isPickup: boolean,
+  isDestination: boolean,
+  depth: number | null,
+  cells: string[]
+): OrderDraftZoneSummary {
+  return {
+    zone_id: z.id,
+    zone_name: z.zone_name,
+    transport_id: z.owner_user_id,
+    transport_name: z.transport_name,
+    transport_method: z.transport_mode,
+    cell_count: z.cell_count,
+    resolution: z.resolution,
+    cells,
+    is_pickup: isPickup,
+    is_destination: isDestination,
+    depth,
+  };
+}
+
+// --------------------------------------------------------------------------
+// Public API
+// --------------------------------------------------------------------------
+
+/**
+ * Build the draft zone-network preview for a (pickup, drop-off) coordinate
+ * pair. Used by the new-order form ("See zone connections") so the sender
+ * can review handoff feasibility before submitting.
+ */
+export async function previewOrderZoneConnectionsByCoordinates(
+  input: OrderDraftPreviewInput
+): Promise<OrderDraftPreview> {
+  const maxDepth = Math.max(1, Math.min(20, input.max_depth ?? DEFAULT_PREVIEW_MAX_DEPTH));
+  const resolution = ORDER_H3_RESOLUTION;
+
+  const sourceH3 = latLngToCell(input.source_lat, input.source_lng, resolution);
+  const destinationH3 = latLngToCell(input.destination_lat, input.destination_lng, resolution);
+
+  // Run zone-meta load, connection load, and the two SQL covering checks in
+  // parallel — none of them depend on each other and each is a single
+  // round-trip, so wall-time should be dominated by the slowest.
+  const [zones, allConnections, pickupIds, destIds] = await Promise.all([
+    loadZoneMeta(),
+    loadConnections(),
+    findCoveringZoneIdsSql(input.source_lat, input.source_lng),
+    findCoveringZoneIdsSql(input.destination_lat, input.destination_lng),
+  ]);
+
+  // Only walk through zones we actually loaded (i.e. `available = TRUE`).
+  // Stale connection rows pointing at unavailable zones must not let BFS
+  // claim a path that the UI can't render.
+  const zoneById = new Map(zones.map((z) => [z.id, z]));
+  const connections = allConnections.filter(
+    (c) => zoneById.has(c.zone_a_id) && zoneById.has(c.zone_b_id)
+  );
+
+  // Drop covering zone ids that aren't in the available set (paranoia: SQL
+  // already filtered, but the meta query could in theory disagree).
+  pickupIds.forEach((id) => {
+    if (!zoneById.has(id)) pickupIds.delete(id);
+  });
+  destIds.forEach((id) => {
+    if (!zoneById.has(id)) destIds.delete(id);
+  });
+
+  const adjacency = new Map<number, { neighbour: number; connection: ConnectionRow }[]>();
+  for (const c of connections) {
+    if (!adjacency.has(c.zone_a_id)) adjacency.set(c.zone_a_id, []);
+    if (!adjacency.has(c.zone_b_id)) adjacency.set(c.zone_b_id, []);
+    adjacency.get(c.zone_a_id)!.push({ neighbour: c.zone_b_id, connection: c });
+    adjacency.get(c.zone_b_id)!.push({ neighbour: c.zone_a_id, connection: c });
+  }
+
+  const pickupZones = pickZones(pickupIds, zoneById);
+  const destinationZones = pickZones(destIds, zoneById);
+  const bfs = bfsFromPickup(Array.from(pickupIds), adjacency, maxDepth);
+
+  // Pre-compute the surfaced zone id list, then fetch their cells in ONE
+  // targeted query. We attach the (sampled) cell list back to each summary
+  // so the front-end map can render zone outlines without a second round
+  // trip.
+  const surfacedIds = new Set<number>();
+  pickupIds.forEach((id) => surfacedIds.add(id));
+  destIds.forEach((id) => surfacedIds.add(id));
+  bfs.depth.forEach((_, id) => surfacedIds.add(id));
+  const cellsByZone = await loadCellsForZoneIds(Array.from(surfacedIds));
+
+  const summaryById = new Map<number, OrderDraftZoneSummary>();
+  function add(zoneId: number) {
+    if (summaryById.has(zoneId)) return;
+    const z = zoneById.get(zoneId);
+    if (!z) return;
+    const depth = bfs.depth.has(zoneId) ? bfs.depth.get(zoneId)! : null;
+    summaryById.set(
+      zoneId,
+      zoneMetaToSummary(
+        z,
+        pickupIds.has(zoneId),
+        destIds.has(zoneId),
+        depth,
+        cellsByZone.get(zoneId) ?? []
+      )
+    );
+  }
+  pickupIds.forEach(add);
+  bfs.depth.forEach((_, id) => add(id));
+  destIds.forEach(add);
+
+  const connectionList: OrderDraftConnection[] = [];
+  const transferCellSet = new Set<string>();
+  for (const c of connections) {
+    if (!summaryById.has(c.zone_a_id) || !summaryById.has(c.zone_b_id)) continue;
+    const used = bfs.usedConnectionIds.has(c.id);
+    connectionList.push({
+      id: c.id,
+      from_zone_id: c.zone_a_id,
+      to_zone_id: c.zone_b_id,
+      connection_type: c.connection_type,
+      transfer_cells: c.transfer_cells,
+      adjacent_cell_pairs: c.adjacent_cell_pairs,
+      used_in_preview: used,
+    });
+    if (used) c.transfer_cells.forEach((cell) => transferCellSet.add(cell));
+  }
+  connectionList.sort((a, b) =>
+    a.used_in_preview === b.used_in_preview ? a.id - b.id : a.used_in_preview ? -1 : 1
+  );
+
+  const reachedDestinationIds = Array.from(destIds).filter((id) => bfs.depth.has(id));
+  const isConnected = reachedDestinationIds.length > 0;
+  const chains = isConnected ? reconstructChains(reachedDestinationIds, bfs) : [];
+
+  const { status, message } = describeStatus(
+    pickupZones.length,
+    destinationZones.length,
+    isConnected,
+    summaryById.size
+  );
+
+  const pickupZoneSummaries = pickupZones
+    .map((z) => summaryById.get(z.id))
+    .filter((s): s is OrderDraftZoneSummary => Boolean(s));
+  const destinationZoneSummaries = destinationZones
+    .map((z) => summaryById.get(z.id))
+    .filter((s): s is OrderDraftZoneSummary => Boolean(s));
+
+  return {
+    source: {
+      name: input.source_name?.trim() || "Pickup",
+      address: input.source_address?.trim() || "",
+      lat: input.source_lat,
+      lng: input.source_lng,
+      h3: sourceH3,
+    },
+    destination: {
+      name: input.destination_name?.trim() || "Destination",
+      address: input.destination_address?.trim() || "",
+      lat: input.destination_lat,
+      lng: input.destination_lng,
+      h3: destinationH3,
+    },
+    preview_resolution: resolution,
+    max_depth: maxDepth,
+    pickup_zones: pickupZoneSummaries,
+    destination_zones: destinationZoneSummaries,
+    connected_zones: Array.from(summaryById.values()).sort((a, b) => {
+      const da = a.depth ?? Number.MAX_SAFE_INTEGER;
+      const db = b.depth ?? Number.MAX_SAFE_INTEGER;
+      if (da !== db) return da - db;
+      return a.zone_name.localeCompare(b.zone_name);
+    }),
+    connections: connectionList,
+    transfer_cells: Array.from(transferCellSet),
+    is_connected_to_destination: isConnected,
+    status,
+    message,
+    possible_connection_chains: chains,
+  };
+}
