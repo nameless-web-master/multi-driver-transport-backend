@@ -13,8 +13,8 @@ import {
   DriverZoneResponse,
   UpdateDriverZoneRequest,
 } from "../schemas/driverZone.schema";
-import { cellResolution, polygonCells, sanitizeCells } from "./h3_service";
-import type { H3Resolution } from "./h3_service";
+import { cellResolution, pointToCell, polygonCells, sanitizeCells } from "./h3_service";
+import type { H3Resolution, LatLng } from "./h3_service";
 import {
   deactivateConnectionsForZone,
   recalculateConnectionsForZone,
@@ -129,22 +129,110 @@ function validateCells(rawCells: string[], resolution: number): string[] {
   return valid;
 }
 
+/**
+ * Compute H3 cells covering a geofence polygon at the given resolution.
+ *
+ * `polygonToCells` only includes cells whose *centers* fall inside the
+ * polygon, so tiny / narrow geofences (or polygons drawn at a too-fine
+ * resolution) can legitimately return 0 cells. Rejecting the request in
+ * that case used to break "update geofence" silently from the driver's
+ * perspective — the front-end just surfaces "no H3 cells at this
+ * resolution" with no way to recover.
+ *
+ * Fallback strategy: when the strict fill is empty, materialize one cell
+ * per polygon vertex plus the cell containing the centroid. That always
+ * produces at least one cell, lets the update succeed, and stays at the
+ * requested resolution so `validateCells` is happy downstream.
+ */
+function cellsFromGeofence(
+  boundary: LatLngPoint[],
+  resolution: H3Resolution
+): string[] {
+  let cells: string[] = [];
+  try {
+    cells = polygonCells(boundary, resolution);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "unknown";
+    throw new Error(`Invalid geofence boundary (h3 error: ${msg})`);
+  }
+  if (cells.length > 0) return cells;
+
+  const seen = new Set<string>();
+  const fallback: string[] = [];
+  let latSum = 0;
+  let lngSum = 0;
+  for (const p of boundary) {
+    latSum += p.lat;
+    lngSum += p.lng;
+    try {
+      const c = pointToCell(p.lat, p.lng, resolution);
+      if (!seen.has(c)) {
+        seen.add(c);
+        fallback.push(c);
+      }
+    } catch {
+      /* ignore invalid vertex; remaining vertices may still resolve */
+    }
+  }
+  try {
+    const centroid: LatLng = {
+      lat: latSum / boundary.length,
+      lng: lngSum / boundary.length,
+    };
+    const c = pointToCell(centroid.lat, centroid.lng, resolution);
+    if (!seen.has(c)) {
+      seen.add(c);
+      fallback.push(c);
+    }
+  } catch {
+    /* centroid out of range — vertex cells (if any) still apply */
+  }
+
+  if (fallback.length === 0) {
+    throw new Error("Geofence boundary produced no H3 cells at this resolution");
+  }
+  return fallback;
+}
+
 function resolveCellsFromInput(
   resolution: number,
   h3_cells?: string[],
   boundary?: LatLngPoint[] | null
 ): { cells: string[]; boundary: LatLngPoint[] | null } {
   if (boundary && boundary.length >= 3) {
-    const cells = polygonCells(boundary, resolution as H3Resolution);
-    if (cells.length === 0) {
-      throw new Error("Geofence boundary produced no H3 cells at this resolution");
-    }
+    const cells = cellsFromGeofence(boundary, resolution as H3Resolution);
     return { cells: validateCells(cells, resolution), boundary };
   }
   if (!h3_cells || h3_cells.length === 0) {
     throw new Error("Provide h3_cells or a geofence boundary");
   }
   return { cells: validateCells(h3_cells, resolution), boundary: null };
+}
+
+/**
+ * True iff two boundaries describe the same polygon (same vertex count,
+ * same lat/lng in the same order, within a tiny epsilon to absorb the
+ * inevitable JSON round-trip noise). Used by the update path to short-
+ * circuit the expensive `polygonToCells` recompute when a driver edits a
+ * metadata-only field (name, rate, availability) on a geofence zone.
+ *
+ * Without this, a rename on a 60k-cell zone re-runs the polygon fill and
+ * re-writes ~1 MB of JSONB on every save — easily blowing past the 15 s
+ * `statement_timeout` and presenting as "geofence update doesn't work"
+ * even though H3-cells zones (which skip the recompute) edit fine.
+ */
+function boundariesEqual(
+  a: LatLngPoint[] | null | undefined,
+  b: LatLngPoint[] | null | undefined
+): boolean {
+  if (!a || !b) return false;
+  if (a.length !== b.length) return false;
+  const eps = 1e-9;
+  for (let i = 0; i < a.length; i++) {
+    if (Math.abs(a[i].lat - b[i].lat) > eps) return false;
+    if (Math.abs(a[i].lng - b[i].lng) > eps) return false;
+  }
+  return true;
 }
 
 export interface ZoneAccessContext {
@@ -292,31 +380,63 @@ export async function updateDriverZone(
   let h3_cells = input.h3_cells ?? existing.h3_cells;
   let boundary: LatLngPoint[] | null =
     input.boundary !== undefined ? input.boundary : existing.boundary;
+  /**
+   * Whether the H3 cell list actually needs to change. Defaults to true to
+   * match the historical behaviour, but the geofence branch below sets it
+   * to false when the polygon + resolution are identical to what's stored
+   * (the common "rename geofence zone" case). Skipping the cell rewrite
+   * then keeps the UPDATE light — critical for zones with tens of
+   * thousands of cells where re-serializing the JSONB blob would otherwise
+   * push us past the 15 s statement_timeout and surface to the driver as
+   * "geofence won't update".
+   */
+  let cellsChanged = true;
 
   if (input.boundary && input.boundary.length >= 3) {
-    const resolved = resolveCellsFromInput(resolution, undefined, input.boundary);
-    h3_cells = resolved.cells;
-    boundary = resolved.boundary;
+    const sameBoundary = boundariesEqual(input.boundary, existing.boundary);
+    const sameResolution = resolution === existing.resolution;
+    if (sameBoundary && sameResolution && existing.h3_cells.length > 0) {
+      // Polygon + resolution unchanged → reuse the existing fill.
+      h3_cells = existing.h3_cells;
+      boundary = input.boundary;
+      cellsChanged = false;
+    } else {
+      const resolved = resolveCellsFromInput(resolution, undefined, input.boundary);
+      h3_cells = resolved.cells;
+      boundary = resolved.boundary;
+    }
   } else if (input.h3_cells) {
     h3_cells = validateCells(input.h3_cells, resolution);
     if (input.boundary === null) boundary = null;
   } else {
     h3_cells = validateCells(h3_cells, resolution);
+    cellsChanged = false;
   }
 
   const params: unknown[] = [
     driver_name,
     zone_name,
     resolution,
-    JSON.stringify(h3_cells),
     transport_mode,
     boundary ? JSON.stringify(boundary) : null,
     rate_cost,
     currency,
     available,
     trust_payment_forwarder,
-    id,
   ];
+
+  // When the geometry didn't change we leave h3_cells alone. Writing a
+  // ~1 MB JSONB blob back for a zone with 60k cells is what was tipping
+  // metadata-only edits past the statement_timeout (manifesting as "the
+  // driver can't update a geofence zone").
+  let cellsSql = "";
+  if (cellsChanged) {
+    params.push(JSON.stringify(h3_cells));
+    cellsSql = `, h3_cells = $${params.length}::jsonb`;
+  }
+
+  params.push(id);
+  const idParamIdx = params.length;
 
   let ownerClause = "";
   if (ctx.role === "driver") {
@@ -328,23 +448,50 @@ export async function updateDriverZone(
 
   const result = await pool.query(
     `UPDATE driver_zones
-       SET driver_name = $1, zone_name = $2, resolution = $3, h3_cells = $4::jsonb,
-           transport_mode = $5, transport_modes = ARRAY[$5]::TEXT[],
-           boundary = $6::jsonb, rate_cost = $7, currency = $8,
-           available = $9, trust_payment_forwarder = $10,
-           updated_at = NOW()
-     WHERE id = $11${ownerClause}
+       SET driver_name = $1, zone_name = $2, resolution = $3,
+           transport_mode = $4, transport_modes = ARRAY[$4]::TEXT[],
+           boundary = $5::jsonb, rate_cost = $6, currency = $7,
+           available = $8, trust_payment_forwarder = $9,
+           updated_at = NOW()${cellsSql}
+     WHERE id = $${idParamIdx}${ownerClause}
      RETURNING id`,
     params
   );
 
   if (result.rowCount === 0) return null;
 
+  const availabilityChanged =
+    input.available !== undefined && input.available !== existing.available;
+
   // Geometry / availability may have changed — refresh connections for
   // this zone only (cheap incremental update, runs in the background).
-  recalculateConnectionsForZone(id).catch((err) =>
-    console.error("[zone-connections] recalc after update failed:", err)
-  );
+  // Skip when only metadata changed: the front-end always includes
+  // `available` in the payload even when it didn't change, so we must
+  // compare against the stored value rather than checking `!== undefined`.
+  if (cellsChanged || availabilityChanged) {
+    recalculateConnectionsForZone(id).catch((err) =>
+      console.error("[zone-connections] recalc after update failed:", err)
+    );
+  }
+
+  // Avoid re-loading a multi-megabyte h3_cells blob when nothing geometric
+  // changed — that second SELECT was adding several seconds to every
+  // metadata edit on large geofence zones.
+  if (!cellsChanged) {
+    return {
+      ...existing,
+      driver_name,
+      zone_name,
+      resolution,
+      transport_mode,
+      rate_cost,
+      currency,
+      available,
+      trust_payment_forwarder,
+      boundary,
+      updated_at: new Date().toISOString(),
+    };
+  }
 
   return getDriverZoneById(id, ctx);
 }
