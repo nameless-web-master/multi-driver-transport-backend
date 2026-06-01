@@ -6,6 +6,7 @@ import { authRouter } from "./routes/auth.routes";
 import { dashboardRouter } from "./routes/dashboard.routes";
 import { h3Router } from "./routes/h3.routes";
 import { driverZonesRouter } from "./routes/driverZones.routes";
+import { driverZoneGraphRouter } from "./routes/driverZoneGraph.routes";
 import { ordersRouter } from "./routes/orders.routes";
 import { usersRouter } from "./routes/users.routes";
 import {
@@ -45,9 +46,15 @@ app.get("/api/health", (_req, res) => {
   res.json({
     status: "ok",
     service: "multi-driver-h3-backend",
-    milestone: 2,
+    milestone: 3,
     auth: true,
-    features: ["zones", "orders", "follows", "zone-connections"],
+    features: [
+      "zones",
+      "orders",
+      "follows",
+      "zone-connections",
+      "driver-zone-graph",
+    ],
   });
 });
 
@@ -61,6 +68,8 @@ app.use("/api/zone-connections", zoneConnectionsRouter);
 // Spec wants the per-zone helpers exposed under /api/zones/:id/... — we
 // mount them on a separate scoped router so the matching is precise.
 app.use("/api/zones", zonesScopedConnectionsRouter);
+// Milestone 3 — Driver-Zone Graph builder.
+app.use("/api/driver-zone-graph", driverZoneGraphRouter);
 
 // 404
 app.use((req, res) => {
