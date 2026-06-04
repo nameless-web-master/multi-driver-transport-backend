@@ -21,6 +21,49 @@ export const ORDER_H3_RESOLUTION = 8;
 /** Default BFS depth limit when walking the zone-connection graph. */
 export const DEFAULT_PREVIEW_MAX_DEPTH = 6;
 
+/**
+ * Great-circle distance between two lat/lng points, in kilometres.
+ * Used only to scale the *display* H3 resolution of the preview cells —
+ * not for any persisted value.
+ */
+function haversineKm(
+  lat1: number,
+  lng1: number,
+  lat2: number,
+  lng2: number
+): number {
+  const R = 6371; // mean Earth radius (km)
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+}
+
+/**
+ * Pick an H3 resolution for the preview's pickup / drop-off cells based on
+ * how far apart they are. The preview map auto-fits both points, so a fixed
+ * res-8 hexagon becomes a barely-visible dot when the two ends are far
+ * apart. Scaling the resolution keeps the cell a readable fraction of the
+ * fitted view (roughly 10–20% of the pickup→drop-off span).
+ *
+ * Approx H3 hexagon edge lengths: r4 ~22.6 km, r5 ~8.5, r6 ~3.2, r7 ~1.2,
+ * r8 ~0.46, r9 ~0.17, r10 ~0.066. This is display-only — the stored
+ * `pickup_h3` / `delivery_h3` on the order always use `ORDER_H3_RESOLUTION`.
+ */
+export function pickPreviewResolution(distanceKm: number): number {
+  if (!Number.isFinite(distanceKm) || distanceKm <= 0) return ORDER_H3_RESOLUTION;
+  if (distanceKm >= 150) return 4;
+  if (distanceKm >= 60) return 5;
+  if (distanceKm >= 20) return 6;
+  if (distanceKm >= 7) return 7;
+  if (distanceKm >= 2.5) return 8;
+  if (distanceKm >= 0.8) return 9;
+  return 10;
+}
+
 export type OrderConnectionStatus =
   | "connected"
   | "not_connected"
@@ -431,7 +474,16 @@ export async function previewOrderZoneConnectionsByCoordinates(
   input: OrderDraftPreviewInput
 ): Promise<OrderDraftPreview> {
   const maxDepth = Math.max(1, Math.min(20, input.max_depth ?? DEFAULT_PREVIEW_MAX_DEPTH));
-  const resolution = ORDER_H3_RESOLUTION;
+  // Display-only resolution: scale the pickup / drop-off cell size to the
+  // distance between them so the hexagons stay visible when the map fits
+  // both ends. Persisted order H3 still uses ORDER_H3_RESOLUTION elsewhere.
+  const distanceKm = haversineKm(
+    input.source_lat,
+    input.source_lng,
+    input.destination_lat,
+    input.destination_lng
+  );
+  const resolution = pickPreviewResolution(distanceKm);
 
   const sourceH3 = latLngToCell(input.source_lat, input.source_lng, resolution);
   const destinationH3 = latLngToCell(input.destination_lat, input.destination_lng, resolution);
