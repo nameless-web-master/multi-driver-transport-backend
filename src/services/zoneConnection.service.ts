@@ -1,4 +1,4 @@
-import { cellToChildren, getResolution, gridDisk, isValidCell } from "h3-js";
+import { cellToChildren, cellToLatLng, getResolution, gridDisk, isValidCell } from "h3-js";
 import { pool } from "../database";
 import type { PoolClient } from "pg";
 import type {
@@ -98,6 +98,77 @@ export interface DetectedConnection {
   connection_type: ConnectionType;
   transfer_cells: string[];
   adjacent_cell_pairs: AdjacentCellPair[];
+  /**
+   * Milestone 2 (updated scope): the single transfer cell the system
+   * recommends when several candidates exist. Chosen as the candidate cell
+   * closest to the midpoint between the two zones' centroids. Null only
+   * when no candidate cell could be resolved.
+   */
+  recommended_transfer_cell: string | null;
+}
+
+interface Coord {
+  lat: number;
+  lng: number;
+}
+
+/** Centroid of an H3 cell set (sampled, cheap). Null when empty/invalid. */
+function centroidOfCells(cells: readonly string[]): Coord | null {
+  if (cells.length === 0) return null;
+  let latSum = 0;
+  let lngSum = 0;
+  let count = 0;
+  const sampleSize = Math.min(cells.length, 500);
+  for (let i = 0; i < sampleSize; i++) {
+    if (!isValidCell(cells[i])) continue;
+    try {
+      const [lat, lng] = cellToLatLng(cells[i]);
+      if (Number.isFinite(lat) && Number.isFinite(lng)) {
+        latSum += lat;
+        lngSum += lng;
+        count++;
+      }
+    } catch {
+      /* skip */
+    }
+  }
+  if (count === 0) return null;
+  return { lat: latSum / count, lng: lngSum / count };
+}
+
+/**
+ * From a list of candidate cells, pick the one whose center is closest to
+ * `target`. Falls back to the first candidate when the target is unknown
+ * (deterministic) — exactly the simpler rule the spec allows. Plain squared
+ * lat/lng distance is sufficient for choosing a representative cell.
+ */
+function pickClosestCell(candidates: readonly string[], target: Coord | null): string | null {
+  if (candidates.length === 0) return null;
+  if (!target) return candidates[0];
+  let best: string | null = null;
+  let bestDist = Infinity;
+  for (const cell of candidates) {
+    if (!isValidCell(cell)) continue;
+    let center: [number, number];
+    try {
+      center = cellToLatLng(cell);
+    } catch {
+      continue;
+    }
+    const dLat = center[0] - target.lat;
+    const dLng = center[1] - target.lng;
+    const dist = dLat * dLat + dLng * dLng;
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = cell;
+    }
+  }
+  return best ?? candidates[0];
+}
+
+function midpoint(a: Coord | null, b: Coord | null): Coord | null {
+  if (!a || !b) return a ?? b ?? null;
+  return { lat: (a.lat + b.lat) / 2, lng: (a.lng + b.lng) / 2 };
 }
 
 /**
@@ -191,12 +262,18 @@ function detectBetweenCells(
     }
   }
 
+  // Midpoint between the two zones' centroids — the target the recommended
+  // transfer cell is chosen to sit closest to.
+  const mid = midpoint(centroidOfCells(aFine), centroidOfCells(bFine));
+
   const overlap = getOverlapCells(aFine, bFine);
   if (overlap.length > 0) {
     return {
       connection_type: "overlap",
       transfer_cells: overlap,
       adjacent_cell_pairs: [],
+      // Overlap: pick the shared cell closest to the midpoint.
+      recommended_transfer_cell: pickClosestCell(overlap, mid),
     };
   }
 
@@ -213,10 +290,35 @@ function detectBetweenCells(
       reps.push(p.from_cell);
       if (reps.length >= 16) break;
     }
+    // Adjacency: pick the touching pair whose midpoint is closest to the
+    // overall midpoint, and recommend that pair's boundary cell (from_cell).
+    let recommended: string | null = reps[0] ?? null;
+    if (mid) {
+      let bestDist = Infinity;
+      for (const p of pairs) {
+        if (!isValidCell(p.from_cell) || !isValidCell(p.to_cell)) continue;
+        let cf: [number, number];
+        let ct: [number, number];
+        try {
+          cf = cellToLatLng(p.from_cell);
+          ct = cellToLatLng(p.to_cell);
+        } catch {
+          continue;
+        }
+        const pmLat = (cf[0] + ct[0]) / 2;
+        const pmLng = (cf[1] + ct[1]) / 2;
+        const dist = (pmLat - mid.lat) ** 2 + (pmLng - mid.lng) ** 2;
+        if (dist < bestDist) {
+          bestDist = dist;
+          recommended = p.from_cell;
+        }
+      }
+    }
     return {
       connection_type: "adjacent",
       transfer_cells: reps,
       adjacent_cell_pairs: pairs,
+      recommended_transfer_cell: recommended,
     };
   }
 
@@ -322,6 +424,7 @@ interface PendingConnection {
   connection_type: ConnectionType;
   transfer_cells: string[];
   adjacent_cell_pairs: AdjacentCellPair[];
+  recommended_transfer_cell: string | null;
   transport_method_a: string | null;
   transport_method_b: string | null;
 }
@@ -353,6 +456,7 @@ function buildPending(
     connection_type: detected.connection_type,
     transfer_cells: detected.transfer_cells,
     adjacent_cell_pairs: pairs,
+    recommended_transfer_cell: detected.recommended_transfer_cell,
     transport_method_a: a.transport_mode,
     transport_method_b: b.transport_mode,
   };
@@ -363,16 +467,18 @@ async function upsertConnection(client: PoolClient, c: PendingConnection): Promi
     `INSERT INTO zone_connections
        (zone_a_id, zone_b_id, transport_a_id, transport_b_id,
         connection_type, transfer_cells, adjacent_cell_pairs,
+        recommended_transfer_cell,
         transport_method_a, transport_method_b, is_active, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, TRUE, NOW())
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, TRUE, NOW())
      ON CONFLICT (zone_a_id, zone_b_id) DO UPDATE SET
-       connection_type     = EXCLUDED.connection_type,
-       transfer_cells      = EXCLUDED.transfer_cells,
-       adjacent_cell_pairs = EXCLUDED.adjacent_cell_pairs,
-       transport_method_a  = EXCLUDED.transport_method_a,
-       transport_method_b  = EXCLUDED.transport_method_b,
-       is_active           = TRUE,
-       updated_at          = NOW()`,
+       connection_type           = EXCLUDED.connection_type,
+       transfer_cells            = EXCLUDED.transfer_cells,
+       adjacent_cell_pairs       = EXCLUDED.adjacent_cell_pairs,
+       recommended_transfer_cell = EXCLUDED.recommended_transfer_cell,
+       transport_method_a        = EXCLUDED.transport_method_a,
+       transport_method_b        = EXCLUDED.transport_method_b,
+       is_active                 = TRUE,
+       updated_at                = NOW()`,
     [
       c.zone_a_id,
       c.zone_b_id,
@@ -381,6 +487,7 @@ async function upsertConnection(client: PoolClient, c: PendingConnection): Promi
       c.connection_type,
       JSON.stringify(c.transfer_cells),
       JSON.stringify(c.adjacent_cell_pairs),
+      c.recommended_transfer_cell,
       c.transport_method_a,
       c.transport_method_b,
     ]
@@ -532,6 +639,7 @@ const CONNECTION_SELECT = `
   SELECT
     c.id, c.zone_a_id, c.zone_b_id, c.transport_a_id, c.transport_b_id,
     c.connection_type, c.transfer_cells, c.adjacent_cell_pairs,
+    c.recommended_transfer_cell,
     c.transport_method_a, c.transport_method_b, c.is_active,
     c.created_at, c.updated_at,
     za.zone_name                    AS zone_a_name,
@@ -596,6 +704,8 @@ function rowToResponse(row: Record<string, unknown>): ZoneConnectionResponse {
     connection_type: String(row.connection_type) as "overlap" | "adjacent",
     transfer_cells: transferCells,
     adjacent_cell_pairs: adjacentPairs,
+    recommended_transfer_cell:
+      row.recommended_transfer_cell == null ? null : String(row.recommended_transfer_cell),
     transport_method_a: row.transport_method_a == null ? null : String(row.transport_method_a),
     transport_method_b: row.transport_method_b == null ? null : String(row.transport_method_b),
     transfer_cell_count: transferCells.length,

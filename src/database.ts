@@ -160,6 +160,18 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'USD';`);
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS available BOOLEAN NOT NULL DEFAULT TRUE;`);
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS trust_payment_forwarder BOOLEAN NOT NULL DEFAULT FALSE;`);
+    // Persist the zone creation method explicitly (previously inferred from
+    // the presence of a boundary). "geofence" when a polygon boundary was
+    // drawn, otherwise "h3". Backfilled from `boundary` for existing rows.
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS zone_type TEXT NOT NULL DEFAULT 'h3';`);
+    await client.query(
+      `UPDATE driver_zones SET zone_type = CASE WHEN boundary IS NOT NULL THEN 'geofence' ELSE 'h3' END
+       WHERE zone_type IS NULL OR zone_type = '';`
+    );
+    await client.query(`ALTER TABLE driver_zones DROP CONSTRAINT IF EXISTS driver_zones_zone_type_check;`);
+    await client.query(
+      `ALTER TABLE driver_zones ADD CONSTRAINT driver_zones_zone_type_check CHECK (zone_type IN ('h3', 'geofence'));`
+    );
     // Drop and rebuild the currency CHECK each boot so adding a code to
     // `CURRENCIES` automatically widens the allowed set without a manual
     // migration. The IN list is derived from the same constant the API uses.
@@ -242,6 +254,26 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_driver_user_id ON orders (driver_user_id);`);
 
     // ----------------------------------------------------------------------
+    // Milestone 1 (updated scope): orders carry the H3 indexes of their
+    // pickup and delivery coordinates, plus the basic package/shipping
+    // metadata the signed-off order form collects. All additive so existing
+    // installs keep working — older rows simply get NULL until recreated
+    // (we backfill H3 from existing coordinates a few lines down).
+    // ----------------------------------------------------------------------
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_h3 TEXT;`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_h3 TEXT;`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS h3_resolution INTEGER;`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS source_name TEXT NOT NULL DEFAULT '';`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS source_contact TEXT NOT NULL DEFAULT '';`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT '';`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_method TEXT NOT NULL DEFAULT '';`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_description TEXT NOT NULL DEFAULT '';`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS weight_kg NUMERIC(12, 3);`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS dimensions TEXT NOT NULL DEFAULT '';`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_pickup_h3 ON orders (pickup_h3);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_delivery_h3 ON orders (delivery_h3);`);
+
+    // ----------------------------------------------------------------------
     // Milestone 2: zone overlap / adjacency graph.
     //
     // Each row represents one undirected connection between two driver zones
@@ -272,6 +304,13 @@ export async function ensureSchema(): Promise<void> {
         CONSTRAINT zone_connections_unique UNIQUE (zone_a_id, zone_b_id)
       );
     `);
+    // Milestone 2 (updated scope): one recommended transfer cell per
+    // connection. Chosen from `transfer_cells` (overlap) or the adjacent
+    // pairs (adjacency) using the midpoint-of-centroids rule in
+    // zoneConnection.service.ts. Additive + nullable for existing rows;
+    // the next recalculation fills it in.
+    await client.query(`ALTER TABLE zone_connections ADD COLUMN IF NOT EXISTS recommended_transfer_cell TEXT;`);
+
     await client.query(`CREATE INDEX IF NOT EXISTS idx_zc_zone_a ON zone_connections (zone_a_id);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_zc_zone_b ON zone_connections (zone_b_id);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_zc_transport_a ON zone_connections (transport_a_id);`);

@@ -53,6 +53,7 @@ export interface GraphEdge {
   connection_type: ConnectionType;
   transfer_cells: string[];
   adjacent_cell_pairs: AdjacentCellPair[];
+  recommended_transfer_cell: string | null;
   transport_method_a: string | null;
   transport_method_b: string | null;
   /**

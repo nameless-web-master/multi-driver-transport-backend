@@ -77,6 +77,7 @@ interface ConnectionRow {
   connection_type: ConnectionType;
   transfer_cells: unknown;
   adjacent_cell_pairs: unknown;
+  recommended_transfer_cell: string | null;
   transport_method_a: string | null;
   transport_method_b: string | null;
   is_active: boolean;
@@ -223,6 +224,7 @@ export function buildEdge(row: ConnectionRow): GraphEdge {
     connection_type: row.connection_type,
     transfer_cells: parseCellArray(row.transfer_cells),
     adjacent_cell_pairs: parseAdjacentPairs(row.adjacent_cell_pairs),
+    recommended_transfer_cell: row.recommended_transfer_cell ?? null,
     transport_method_a: row.transport_method_a,
     transport_method_b: row.transport_method_b,
     weight: 1,
@@ -415,6 +417,7 @@ const ZONE_SELECT = `
 const CONNECTION_SELECT = `
   SELECT c.id, c.zone_a_id, c.zone_b_id, c.transport_a_id, c.transport_b_id,
          c.connection_type, c.transfer_cells, c.adjacent_cell_pairs,
+         c.recommended_transfer_cell,
          c.transport_method_a, c.transport_method_b, c.is_active
   FROM zone_connections c
   WHERE c.is_active = TRUE

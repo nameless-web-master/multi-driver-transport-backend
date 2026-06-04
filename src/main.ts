@@ -8,6 +8,8 @@ import { h3Router } from "./routes/h3.routes";
 import { driverZonesRouter } from "./routes/driverZones.routes";
 import { driverZoneGraphRouter } from "./routes/driverZoneGraph.routes";
 import { ordersRouter } from "./routes/orders.routes";
+import { orderGraphRouter } from "./routes/orderGraph.routes";
+import { backfillOrderH3 } from "./services/order.service";
 import { usersRouter } from "./routes/users.routes";
 import {
   zoneConnectionsRouter,
@@ -54,6 +56,7 @@ app.get("/api/health", (_req, res) => {
       "follows",
       "zone-connections",
       "driver-zone-graph",
+      "order-graph",
     ],
   });
 });
@@ -70,6 +73,8 @@ app.use("/api/zone-connections", zoneConnectionsRouter);
 app.use("/api/zones", zonesScopedConnectionsRouter);
 // Milestone 3 — Driver-Zone Graph builder.
 app.use("/api/driver-zone-graph", driverZoneGraphRouter);
+// Milestone 3 — Order-based transporter graph (sender → receiver).
+app.use("/api/order-graph", orderGraphRouter);
 
 // 404
 app.use((req, res) => {
@@ -86,6 +91,14 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 async function bootstrap() {
   await ensureSchema();
+  // Backfill H3 indexes for pre-existing orders (best-effort; never blocks
+  // startup if it fails — new orders compute H3 at creation time anyway).
+  try {
+    const filled = await backfillOrderH3();
+    if (filled > 0) console.log(`[db] backfilled H3 for ${filled} order(s)`);
+  } catch (err) {
+    console.error("[db] order H3 backfill failed:", err);
+  }
   app.listen(PORT, () => {
     console.log(`API ready on http://localhost:${PORT}`);
   });

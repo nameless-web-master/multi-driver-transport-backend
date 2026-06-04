@@ -8,6 +8,19 @@ export const createOrderSchema = z.object({
   sender_lng: longitudeSchema.optional().nullable(),
   notes: z.string().trim().max(1000).optional().default(""),
   driver_user_id: z.number().int().positive().optional().nullable(),
+  // ---- Milestone 1 (updated scope): basic order form fields. ----
+  source_name: z.string().trim().max(200).optional().default(""),
+  source_contact: z.string().trim().max(120).optional().default(""),
+  payment_method: z.string().trim().max(60).optional().default(""),
+  shipping_method: z.string().trim().max(60).optional().default(""),
+  package_description: z.string().trim().max(1000).optional().default(""),
+  weight_kg: z
+    .number({ invalid_type_error: "weight_kg must be a number" })
+    .min(0)
+    .max(1_000_000)
+    .optional()
+    .nullable(),
+  dimensions: z.string().trim().max(120).optional().default(""),
 });
 
 export const updateOrderStatusSchema = z.object({

@@ -33,6 +33,8 @@ export interface ZoneConnectionResponse {
   connection_type: "overlap" | "adjacent";
   transfer_cells: string[];
   adjacent_cell_pairs: AdjacentCellPair[];
+  /** The single recommended transfer cell (closest to the zone-centroid midpoint). */
+  recommended_transfer_cell: string | null;
   transport_method_a: string | null;
   transport_method_b: string | null;
   /** Counts surfaced for convenience so the UI doesn't have to recompute. */
