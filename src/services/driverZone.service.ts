@@ -4,6 +4,7 @@ import {
   DriverZoneCreateInput,
   DriverZoneRow,
   DriverZoneUpdateInput,
+  HubTerminal,
   LatLngPoint,
 } from "../models/driverZone.model";
 import type { TransportMode } from "../models/transportMode.model";
@@ -22,12 +23,36 @@ import {
 
 const ZONE_SELECT = `
   SELECT z.id, z.owner_user_id, z.driver_name, z.zone_name, z.resolution, z.h3_cells,
-         z.transport_mode, z.boundary, z.rate_cost, z.currency, z.available, z.trust_payment_forwarder,
+         z.transport_mode, z.boundary,
+         z.departure_hub_name, z.departure_hub_lat, z.departure_hub_lng,
+         z.arrival_hub_name, z.arrival_hub_lat, z.arrival_hub_lng,
+         z.departure_time, z.arrival_time,
+         z.rate_cost, z.currency, z.available, z.trust_payment_forwarder,
          z.created_at, z.updated_at,
          COALESCE(u.trustworthiness, 0) AS driver_trustworthiness
   FROM driver_zones z
   LEFT JOIN users u ON u.id = z.owner_user_id
 `;
+
+function isHubTransportMode(mode: string): boolean {
+  return mode === "air" || mode === "sea";
+}
+
+function parseHubFromRow(
+  row: Record<string, unknown>,
+  prefix: "departure" | "arrival"
+): HubTerminal | null {
+  const name = row[`${prefix}_hub_name`];
+  const lat = row[`${prefix}_hub_lat`];
+  const lng = row[`${prefix}_hub_lng`];
+  if (name == null || lat == null || lng == null) return null;
+  const latN = Number(lat);
+  const lngN = Number(lng);
+  if (!Number.isFinite(latN) || !Number.isFinite(lngN)) return null;
+  const nameStr = String(name).trim();
+  if (!nameStr) return null;
+  return { name: nameStr, lat: latN, lng: lngN };
+}
 
 function rowToResponse(row: DriverZoneRow & { driver_trustworthiness?: number }): DriverZoneResponse {
   const cells = Array.isArray(row.h3_cells) ? row.h3_cells : [];
@@ -41,6 +66,10 @@ function rowToResponse(row: DriverZoneRow & { driver_trustworthiness?: number })
     cell_count: cells.length,
     transport_mode: row.transport_mode,
     boundary: row.boundary,
+    departure_hub: row.departure_hub,
+    arrival_hub: row.arrival_hub,
+    departure_time: row.departure_time,
+    arrival_time: row.arrival_time,
     rate_cost: row.rate_cost,
     currency: row.currency,
     available: row.available,
@@ -100,6 +129,10 @@ function parseRow(row: Record<string, unknown>): DriverZoneRow & { driver_trustw
     h3_cells,
     transport_mode,
     boundary: parseBoundary(row.boundary),
+    departure_hub: parseHubFromRow(row, "departure"),
+    arrival_hub: parseHubFromRow(row, "arrival"),
+    departure_time: row.departure_time == null ? null : String(row.departure_time),
+    arrival_time: row.arrival_time == null ? null : String(row.arrival_time),
     rate_cost: Number(row.rate_cost ?? 0),
     currency: normalizeCurrency(row.currency),
     available: Boolean(row.available ?? true),
@@ -194,11 +227,52 @@ function cellsFromGeofence(
   return fallback;
 }
 
+/**
+ * Derive minimal H3 cells from hub terminal coordinates so the connection
+ * graph can still reference this zone. One cell per hub at the given resolution.
+ */
+function cellsFromHubs(
+  departure: HubTerminal,
+  arrival: HubTerminal,
+  resolution: H3Resolution
+): string[] {
+  const seen = new Set<string>();
+  const cells: string[] = [];
+  for (const hub of [departure, arrival]) {
+    try {
+      const c = pointToCell(hub.lat, hub.lng, resolution);
+      if (!seen.has(c)) {
+        seen.add(c);
+        cells.push(c);
+      }
+    } catch {
+      throw new Error(`Hub "${hub.name}" coordinates are out of range for H3`);
+    }
+  }
+  if (cells.length === 0) {
+    throw new Error("Could not resolve H3 cells from hub coordinates");
+  }
+  return cells;
+}
+
 function resolveCellsFromInput(
   resolution: number,
   h3_cells?: string[],
-  boundary?: LatLngPoint[] | null
+  boundary?: LatLngPoint[] | null,
+  transportMode?: TransportMode,
+  departureHub?: HubTerminal | null,
+  arrivalHub?: HubTerminal | null
 ): { cells: string[]; boundary: LatLngPoint[] | null } {
+  const hubRoute =
+    (transportMode && isHubTransportMode(transportMode)) ||
+    (!!departureHub && !!arrivalHub);
+  if (hubRoute) {
+    if (!departureHub || !arrivalHub) {
+      throw new Error("departure_hub and arrival_hub are required for air/sea routes");
+    }
+    const cells = cellsFromHubs(departureHub, arrivalHub, resolution as H3Resolution);
+    return { cells: validateCells(cells, resolution), boundary: null };
+  }
   if (boundary && boundary.length >= 3) {
     const cells = cellsFromGeofence(boundary, resolution as H3Resolution);
     return { cells: validateCells(cells, resolution), boundary };
@@ -302,14 +376,23 @@ export async function createDriverZone(
   const { cells, boundary } = resolveCellsFromInput(
     input.resolution,
     input.h3_cells,
-    input.boundary
+    input.boundary,
+    input.transport_mode,
+    input.departure_hub,
+    input.arrival_hub
   );
 
   const result = await pool.query(
     `INSERT INTO driver_zones
        (owner_user_id, driver_name, zone_name, resolution, h3_cells, transport_modes, transport_mode,
-        boundary, rate_cost, currency, available, trust_payment_forwarder)
-     VALUES ($1, $2, $3, $4, $5::jsonb, ARRAY[$6]::TEXT[], $6, $7::jsonb, $8, $9, $10, $11)
+        boundary,
+        departure_hub_name, departure_hub_lat, departure_hub_lng,
+        arrival_hub_name, arrival_hub_lat, arrival_hub_lng,
+        departure_time, arrival_time,
+        rate_cost, currency, available, trust_payment_forwarder)
+     VALUES ($1, $2, $3, $4, $5::jsonb, ARRAY[$6]::TEXT[], $6, $7::jsonb,
+             $8, $9, $10, $11, $12, $13, $14, $15,
+             $16, $17, $18, $19)
      RETURNING id`,
     [
       input.owner_user_id,
@@ -319,6 +402,14 @@ export async function createDriverZone(
       JSON.stringify(cells),
       input.transport_mode,
       boundary ? JSON.stringify(boundary) : null,
+      input.departure_hub?.name ?? null,
+      input.departure_hub?.lat ?? null,
+      input.departure_hub?.lng ?? null,
+      input.arrival_hub?.name ?? null,
+      input.arrival_hub?.lat ?? null,
+      input.arrival_hub?.lng ?? null,
+      input.departure_time ?? null,
+      input.arrival_time ?? null,
       input.rate_cost,
       normalizeCurrency(input.currency),
       input.available,
@@ -343,7 +434,14 @@ export async function createDriverZoneFromRequest(
   ownerUserId: number,
   data: CreateDriverZoneRequest
 ): Promise<DriverZoneResponse> {
-  const { cells, boundary } = resolveCellsFromInput(data.resolution, data.h3_cells, data.boundary);
+  const { cells, boundary } = resolveCellsFromInput(
+    data.resolution,
+    data.h3_cells,
+    data.boundary,
+    data.transport_mode,
+    data.departure_hub,
+    data.arrival_hub
+  );
   return createDriverZone({
     owner_user_id: ownerUserId,
     driver_name: data.driver_name,
@@ -352,6 +450,10 @@ export async function createDriverZoneFromRequest(
     h3_cells: cells,
     transport_mode: data.transport_mode,
     boundary,
+    departure_hub: data.departure_hub ?? null,
+    arrival_hub: data.arrival_hub ?? null,
+    departure_time: data.departure_time ?? null,
+    arrival_time: data.arrival_time ?? null,
     rate_cost: data.rate_cost,
     currency: normalizeCurrency(data.currency ?? DEFAULT_CURRENCY),
     available: data.available,
@@ -376,6 +478,14 @@ export async function updateDriverZone(
   const available = input.available ?? existing.available;
   const trust_payment_forwarder =
     input.trust_payment_forwarder ?? existing.trust_payment_forwarder;
+  const departure_hub =
+    input.departure_hub !== undefined ? input.departure_hub : existing.departure_hub;
+  const arrival_hub =
+    input.arrival_hub !== undefined ? input.arrival_hub : existing.arrival_hub;
+  const departure_time =
+    input.departure_time !== undefined ? input.departure_time : existing.departure_time;
+  const arrival_time =
+    input.arrival_time !== undefined ? input.arrival_time : existing.arrival_time;
 
   let h3_cells = input.h3_cells ?? existing.h3_cells;
   let boundary: LatLngPoint[] | null =
@@ -392,7 +502,31 @@ export async function updateDriverZone(
    */
   let cellsChanged = true;
 
-  if (input.boundary && input.boundary.length >= 3) {
+  if (isHubTransportMode(transport_mode)) {
+    if (!departure_hub || !arrival_hub) {
+      throw new Error("departure_hub and arrival_hub are required for air/sea routes");
+    }
+    const hubsChanged =
+      input.departure_hub !== undefined ||
+      input.arrival_hub !== undefined ||
+      input.transport_mode !== undefined ||
+      resolution !== existing.resolution;
+    if (hubsChanged) {
+      const resolved = resolveCellsFromInput(
+        resolution,
+        undefined,
+        null,
+        transport_mode,
+        departure_hub,
+        arrival_hub
+      );
+      h3_cells = resolved.cells;
+      boundary = null;
+    } else {
+      h3_cells = existing.h3_cells;
+      cellsChanged = false;
+    }
+  } else if (input.boundary && input.boundary.length >= 3) {
     const sameBoundary = boundariesEqual(input.boundary, existing.boundary);
     const sameResolution = resolution === existing.resolution;
     if (sameBoundary && sameResolution && existing.h3_cells.length > 0) {
@@ -419,6 +553,14 @@ export async function updateDriverZone(
     resolution,
     transport_mode,
     boundary ? JSON.stringify(boundary) : null,
+    departure_hub?.name ?? null,
+    departure_hub?.lat ?? null,
+    departure_hub?.lng ?? null,
+    arrival_hub?.name ?? null,
+    arrival_hub?.lat ?? null,
+    arrival_hub?.lng ?? null,
+    departure_time,
+    arrival_time,
     rate_cost,
     currency,
     available,
@@ -450,8 +592,12 @@ export async function updateDriverZone(
     `UPDATE driver_zones
        SET driver_name = $1, zone_name = $2, resolution = $3,
            transport_mode = $4, transport_modes = ARRAY[$4]::TEXT[],
-           boundary = $5::jsonb, rate_cost = $6, currency = $7,
-           available = $8, trust_payment_forwarder = $9,
+           boundary = $5::jsonb,
+           departure_hub_name = $6, departure_hub_lat = $7, departure_hub_lng = $8,
+           arrival_hub_name = $9, arrival_hub_lat = $10, arrival_hub_lng = $11,
+           departure_time = $12, arrival_time = $13,
+           rate_cost = $14, currency = $15,
+           available = $16, trust_payment_forwarder = $17,
            updated_at = NOW()${cellsSql}
      WHERE id = $${idParamIdx}${ownerClause}
      RETURNING id`,
@@ -484,6 +630,10 @@ export async function updateDriverZone(
       zone_name,
       resolution,
       transport_mode,
+      departure_hub,
+      arrival_hub,
+      departure_time,
+      arrival_time,
       rate_cost,
       currency,
       available,
@@ -508,6 +658,10 @@ export async function updateDriverZoneFromRequest(
     h3_cells: data.h3_cells,
     transport_mode: data.transport_mode,
     boundary: data.boundary,
+    departure_hub: data.departure_hub,
+    arrival_hub: data.arrival_hub,
+    departure_time: data.departure_time,
+    arrival_time: data.arrival_time,
     rate_cost: data.rate_cost,
     currency: data.currency,
     available: data.available,

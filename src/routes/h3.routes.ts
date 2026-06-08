@@ -1,9 +1,18 @@
 import { Router, Request, Response } from "express";
+import { z } from "zod";
 import { requireAuth } from "../dependencies/auth.middleware";
 import { convertRequestSchema, ConvertResponse } from "../schemas/h3.schema";
 import { polygonToCellsSchema } from "../schemas/h3Polygon.schema";
 import { cellCenter, H3Resolution, pointToCell } from "../services/h3_service";
 import { hierarchicalPolygonCells } from "../services/hierarchicalFill";
+import { computeSeaRoute } from "../services/seaRoute.service";
+
+const seaRouteQuerySchema = z.object({
+  from_lat: z.coerce.number().min(-90).max(90),
+  from_lng: z.coerce.number().min(-180).max(180),
+  to_lat: z.coerce.number().min(-90).max(90),
+  to_lng: z.coerce.number().min(-180).max(180),
+});
 
 export const h3Router = Router();
 
@@ -37,6 +46,29 @@ h3Router.post("/convert", (req: Request, res: Response) => {
   } catch (err) {
     const message = err instanceof Error ? err.message : "H3 conversion failed";
     return res.status(400).json({ error: message });
+  }
+});
+
+/** Shortest maritime path between two coordinates (for sea zone previews). */
+h3Router.get("/sea-route", (req: Request, res: Response) => {
+  const parsed = seaRouteQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Validation failed",
+      details: parsed.error.flatten().fieldErrors,
+    });
+  }
+
+  const { from_lat, from_lng, to_lat, to_lng } = parsed.data;
+  try {
+    const coordinates = computeSeaRoute(
+      { lat: from_lat, lng: from_lng },
+      { lat: to_lat, lng: to_lng }
+    );
+    return res.json({ coordinates });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Sea route failed";
+    return res.status(500).json({ error: message });
   }
 });
 

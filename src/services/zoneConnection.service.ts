@@ -1,9 +1,17 @@
-import { cellToChildren, cellToLatLng, getResolution, gridDisk, isValidCell } from "h3-js";
+import {
+  cellToChildren,
+  cellToLatLng,
+  getResolution,
+  gridDisk,
+  isValidCell,
+  latLngToCell,
+} from "h3-js";
 import { pool } from "../database";
 import type { PoolClient } from "pg";
 import type {
   AdjacentCellPair,
   ConnectionType,
+  HubRole,
   ZoneConnectionRow,
 } from "../models/zoneConnection.model";
 import type { UserRole } from "../models/userRole.model";
@@ -348,6 +356,12 @@ export function detectConnection(
 // Persistence helpers
 // --------------------------------------------------------------------------
 
+interface HubPoint {
+  name: string;
+  lat: number;
+  lng: number;
+}
+
 interface ZoneSlim {
   id: number;
   owner_user_id: number;
@@ -359,6 +373,25 @@ interface ZoneSlim {
    * Falls back to the first cell's actual resolution if the column is null.
    */
   resolution: number;
+  /** Air/sea hub terminals (null for land zones). */
+  departure_hub: HubPoint | null;
+  arrival_hub: HubPoint | null;
+}
+
+/** Columns every zone fetch needs so hub detection has the terminal coords. */
+const ZONE_SLIM_COLUMNS = `id, owner_user_id, h3_cells, transport_mode, resolution,
+  departure_hub_name, departure_hub_lat, departure_hub_lng,
+  arrival_hub_name, arrival_hub_lat, arrival_hub_lng`;
+
+function parseHubPoint(
+  row: Record<string, unknown>,
+  prefix: "departure_hub" | "arrival_hub"
+): HubPoint | null {
+  const name = row[`${prefix}_name`];
+  const lat = Number(row[`${prefix}_lat`]);
+  const lng = Number(row[`${prefix}_lng`]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return { name: name == null ? "" : String(name), lat, lng };
 }
 
 function parseZoneRow(row: Record<string, unknown>): ZoneSlim {
@@ -389,12 +422,14 @@ function parseZoneRow(row: Record<string, unknown>): ZoneSlim {
     cells: normalized,
     transport_mode: row.transport_mode == null ? null : String(row.transport_mode),
     resolution: Number.isFinite(resolution) ? resolution : 0,
+    departure_hub: parseHubPoint(row, "departure_hub"),
+    arrival_hub: parseHubPoint(row, "arrival_hub"),
   };
 }
 
 async function fetchActiveZones(client: PoolClient | typeof pool): Promise<ZoneSlim[]> {
   const result = await client.query(
-    `SELECT id, owner_user_id, h3_cells, transport_mode, resolution
+    `SELECT ${ZONE_SLIM_COLUMNS}
      FROM driver_zones
      WHERE available = TRUE
      ORDER BY id`
@@ -407,7 +442,7 @@ async function fetchZoneById(
   zoneId: number
 ): Promise<ZoneSlim | null> {
   const result = await client.query(
-    `SELECT id, owner_user_id, h3_cells, transport_mode, resolution
+    `SELECT ${ZONE_SLIM_COLUMNS}
      FROM driver_zones
      WHERE id = $1 AND available = TRUE`,
     [zoneId]
@@ -427,6 +462,130 @@ interface PendingConnection {
   recommended_transfer_cell: string | null;
   transport_method_a: string | null;
   transport_method_b: string | null;
+  hub_role_a: HubRole | null;
+  hub_role_b: HubRole | null;
+}
+
+/** Air / sea transport is hub/port based — no cell-level handoff surface. */
+function isHubTransportMode(mode: string | null): boolean {
+  const v = (mode ?? "").toLowerCase();
+  return v === "air" || v === "sea";
+}
+
+interface DetectedHubConnection {
+  /** Which hub of the air/sea zone the land zone meets. */
+  hub_role: HubRole;
+  connection_type: ConnectionType;
+  /** The land-zone cell at (or next to) the hub — used as the transfer cell. */
+  transfer_cell: string;
+}
+
+/**
+ * Point-based handoff between an air/sea zone and a land zone.
+ *
+ * Real-world flow: a land transporter delivers cargo to the departure hub
+ * (airport/port), and another land transporter collects it at the arrival
+ * hub. So we test whether the land zone *covers* (contains) or *touches*
+ * (ring-1 adjacent to) each hub point, and anchor the connection to that hub.
+ *
+ * Containment is preferred over adjacency, and departure over arrival on a
+ * tie, because only one row can exist per zone pair.
+ */
+function detectHubToLand(hubZone: ZoneSlim, landZone: ZoneSlim): DetectedHubConnection | null {
+  if (landZone.cells.length === 0) return null;
+  const landSet = new Set(landZone.cells);
+  const landRes = landZone.resolution;
+
+  const candidates: { role: HubRole; hub: HubPoint }[] = [];
+  if (hubZone.departure_hub) candidates.push({ role: "departure", hub: hubZone.departure_hub });
+  if (hubZone.arrival_hub) candidates.push({ role: "arrival", hub: hubZone.arrival_hub });
+
+  let adjacentMatch: DetectedHubConnection | null = null;
+
+  for (const { role, hub } of candidates) {
+    let hubCell: string;
+    try {
+      hubCell = latLngToCell(hub.lat, hub.lng, landRes);
+    } catch {
+      continue;
+    }
+    // Containment — the hub sits inside the land zone's coverage.
+    if (landSet.has(hubCell)) {
+      return { hub_role: role, connection_type: "hub", transfer_cell: hubCell };
+    }
+    // Touching — a ring-1 neighbour of the hub cell belongs to the land zone.
+    if (!adjacentMatch) {
+      let ring: string[];
+      try {
+        ring = gridDisk(hubCell, 1);
+      } catch {
+        ring = [];
+      }
+      for (const neighbour of ring) {
+        if (neighbour !== hubCell && landSet.has(neighbour)) {
+          adjacentMatch = { hub_role: role, connection_type: "hub", transfer_cell: neighbour };
+          break;
+        }
+      }
+    }
+  }
+
+  return adjacentMatch;
+}
+
+/**
+ * Build a hub PendingConnection. `hubZone` meets `landZone` at `hubRole`.
+ * Ordering is normalized so the lower zone id is `zone_a`; the hub role is
+ * recorded on whichever side is the air/sea zone.
+ */
+function buildHubPending(
+  hubZone: ZoneSlim,
+  landZone: ZoneSlim,
+  detected: DetectedHubConnection
+): PendingConnection {
+  const [a, b] = hubZone.id < landZone.id ? [hubZone, landZone] : [landZone, hubZone];
+  const hubIsA = a.id === hubZone.id;
+  return {
+    zone_a_id: a.id,
+    zone_b_id: b.id,
+    transport_a_id: a.owner_user_id,
+    transport_b_id: b.owner_user_id,
+    connection_type: "hub",
+    transfer_cells: [detected.transfer_cell],
+    adjacent_cell_pairs: [],
+    recommended_transfer_cell: detected.transfer_cell,
+    transport_method_a: a.transport_mode,
+    transport_method_b: b.transport_mode,
+    hub_role_a: hubIsA ? detected.hub_role : null,
+    hub_role_b: hubIsA ? null : detected.hub_role,
+  };
+}
+
+/**
+ * Resolve the connection between any two zones, dispatching on whether each
+ * side is hub-based (air/sea) or land. Returns null when unrelated.
+ */
+function detectPair(z1: ZoneSlim, z2: ZoneSlim): PendingConnection | null {
+  const z1Hub = isHubTransportMode(z1.transport_mode);
+  const z2Hub = isHubTransportMode(z2.transport_mode);
+
+  // Air/sea ↔ land: point-based hub handoff.
+  if (z1Hub !== z2Hub) {
+    const hubZone = z1Hub ? z1 : z2;
+    const landZone = z1Hub ? z2 : z1;
+    const detected = detectHubToLand(hubZone, landZone);
+    if (!detected) return null;
+    return buildHubPending(hubZone, landZone, detected);
+  }
+
+  // Two air/sea zones don't share a cell-level handoff surface. A shared
+  // airport/port could link them, but that's out of scope here.
+  if (z1Hub && z2Hub) return null;
+
+  // Land ↔ land: existing area overlap / adjacency.
+  const detected = detectBetweenCells(z1.cells, z2.cells, z1.resolution, z2.resolution);
+  if (!detected) return null;
+  return buildPending(z1, z2, detected);
 }
 
 /**
@@ -443,22 +602,35 @@ function buildPending(
   // If we flipped order, the adjacency pair direction must flip too so
   // `from_cell` always refers to a cell in zone_a.
   const flipped = a.id !== z1.id;
-  const pairs = flipped
+
+  // For air/sea legs the package is only ever picked up / dropped off at the
+  // hub airport or port — what happens between two hubs is undefined. The
+  // H3-cell overlap we detect for these zones is just a geographic catchment
+  // coincidence, so we keep the *relationship* (the edge) but strip the
+  // cell-level transfer/adjacency payload that would otherwise paint a
+  // misleading mid-route handoff on the map.
+  const hubConnection =
+    isHubTransportMode(a.transport_mode) || isHubTransportMode(b.transport_mode);
+
+  const pairs = hubConnection
+    ? []
+    : flipped
     ? detected.adjacent_cell_pairs.map((p) => ({ from_cell: p.to_cell, to_cell: p.from_cell }))
     : detected.adjacent_cell_pairs;
-  // Same with overlap transfer_cells — set semantics, order doesn't matter,
-  // but keep a stable shape.
+
   return {
     zone_a_id: a.id,
     zone_b_id: b.id,
     transport_a_id: a.owner_user_id,
     transport_b_id: b.owner_user_id,
     connection_type: detected.connection_type,
-    transfer_cells: detected.transfer_cells,
+    transfer_cells: hubConnection ? [] : detected.transfer_cells,
     adjacent_cell_pairs: pairs,
-    recommended_transfer_cell: detected.recommended_transfer_cell,
+    recommended_transfer_cell: hubConnection ? null : detected.recommended_transfer_cell,
     transport_method_a: a.transport_mode,
     transport_method_b: b.transport_mode,
+    hub_role_a: null,
+    hub_role_b: null,
   };
 }
 
@@ -468,8 +640,9 @@ async function upsertConnection(client: PoolClient, c: PendingConnection): Promi
        (zone_a_id, zone_b_id, transport_a_id, transport_b_id,
         connection_type, transfer_cells, adjacent_cell_pairs,
         recommended_transfer_cell,
-        transport_method_a, transport_method_b, is_active, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, TRUE, NOW())
+        transport_method_a, transport_method_b,
+        hub_role_a, hub_role_b, is_active, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9, $10, $11, $12, TRUE, NOW())
      ON CONFLICT (zone_a_id, zone_b_id) DO UPDATE SET
        connection_type           = EXCLUDED.connection_type,
        transfer_cells            = EXCLUDED.transfer_cells,
@@ -477,6 +650,8 @@ async function upsertConnection(client: PoolClient, c: PendingConnection): Promi
        recommended_transfer_cell = EXCLUDED.recommended_transfer_cell,
        transport_method_a        = EXCLUDED.transport_method_a,
        transport_method_b        = EXCLUDED.transport_method_b,
+       hub_role_a                = EXCLUDED.hub_role_a,
+       hub_role_b                = EXCLUDED.hub_role_b,
        is_active                 = TRUE,
        updated_at                = NOW()`,
     [
@@ -490,6 +665,8 @@ async function upsertConnection(client: PoolClient, c: PendingConnection): Promi
       c.recommended_transfer_cell,
       c.transport_method_a,
       c.transport_method_b,
+      c.hub_role_a,
+      c.hub_role_b,
     ]
   );
 }
@@ -515,26 +692,24 @@ export async function recalculateAllZoneConnections(): Promise<RecalcStats> {
 
     let overlap = 0;
     let adjacent = 0;
+    let hub = 0;
     for (let i = 0; i < zones.length; i++) {
       for (let j = i + 1; j < zones.length; j++) {
-        const detected = detectBetweenCells(
-          zones[i].cells,
-          zones[j].cells,
-          zones[i].resolution,
-          zones[j].resolution
-        );
-        if (!detected) continue;
-        if (detected.connection_type === "overlap") overlap++;
+        const pending = detectPair(zones[i], zones[j]);
+        if (!pending) continue;
+        if (pending.connection_type === "overlap") overlap++;
+        else if (pending.connection_type === "hub") hub++;
         else adjacent++;
-        await upsertConnection(client, buildPending(zones[i], zones[j], detected));
+        await upsertConnection(client, pending);
       }
     }
 
     await client.query("COMMIT");
     return {
-      total_connections: overlap + adjacent,
+      total_connections: overlap + adjacent + hub,
       overlap_connections: overlap,
       adjacent_connections: adjacent,
+      hub_connections: hub,
       zones_compared: zones.length,
     };
   } catch (err) {
@@ -565,18 +740,23 @@ export async function recalculateConnectionsForZone(zoneId: number): Promise<Rec
       [zoneId]
     );
 
-    if (!target || target.cells.length === 0) {
+    // A hub (air/sea) zone with no land coverage of its own still needs to
+    // connect to land zones at its terminals, so we only bail when the zone
+    // has neither cells nor hubs.
+    const targetIsHub = target != null && isHubTransportMode(target.transport_mode);
+    if (!target || (target.cells.length === 0 && !targetIsHub)) {
       await client.query("COMMIT");
       return {
         total_connections: 0,
         overlap_connections: 0,
         adjacent_connections: 0,
+        hub_connections: 0,
         zones_compared: 0,
       };
     }
 
     const others = await client.query(
-      `SELECT id, owner_user_id, h3_cells, transport_mode
+      `SELECT ${ZONE_SLIM_COLUMNS}
        FROM driver_zones
        WHERE id <> $1 AND available = TRUE`,
       [zoneId]
@@ -585,24 +765,22 @@ export async function recalculateConnectionsForZone(zoneId: number): Promise<Rec
 
     let overlap = 0;
     let adjacent = 0;
+    let hub = 0;
     for (const other of otherZones) {
-      const detected = detectBetweenCells(
-        target.cells,
-        other.cells,
-        target.resolution,
-        other.resolution
-      );
-      if (!detected) continue;
-      if (detected.connection_type === "overlap") overlap++;
+      const pending = detectPair(target, other);
+      if (!pending) continue;
+      if (pending.connection_type === "overlap") overlap++;
+      else if (pending.connection_type === "hub") hub++;
       else adjacent++;
-      await upsertConnection(client, buildPending(target, other, detected));
+      await upsertConnection(client, pending);
     }
 
     await client.query("COMMIT");
     return {
-      total_connections: overlap + adjacent,
+      total_connections: overlap + adjacent + hub,
       overlap_connections: overlap,
       adjacent_connections: adjacent,
+      hub_connections: hub,
       zones_compared: otherZones.length,
     };
   } catch (err) {
@@ -640,16 +818,33 @@ const CONNECTION_SELECT = `
     c.id, c.zone_a_id, c.zone_b_id, c.transport_a_id, c.transport_b_id,
     c.connection_type, c.transfer_cells, c.adjacent_cell_pairs,
     c.recommended_transfer_cell,
-    c.transport_method_a, c.transport_method_b, c.is_active,
+    c.transport_method_a, c.transport_method_b,
+    c.hub_role_a, c.hub_role_b, c.is_active,
     c.created_at, c.updated_at,
     za.zone_name                    AS zone_a_name,
     jsonb_array_length(za.h3_cells) AS zone_a_cell_count,
     za.resolution                   AS zone_a_resolution,
     za.h3_cells                     AS zone_a_cells,
+    za.departure_hub_name           AS zone_a_departure_hub_name,
+    za.departure_hub_lat            AS zone_a_departure_hub_lat,
+    za.departure_hub_lng            AS zone_a_departure_hub_lng,
+    za.arrival_hub_name             AS zone_a_arrival_hub_name,
+    za.arrival_hub_lat              AS zone_a_arrival_hub_lat,
+    za.arrival_hub_lng              AS zone_a_arrival_hub_lng,
+    za.departure_time               AS zone_a_departure_time,
+    za.arrival_time                 AS zone_a_arrival_time,
     zb.zone_name                    AS zone_b_name,
     jsonb_array_length(zb.h3_cells) AS zone_b_cell_count,
     zb.resolution                   AS zone_b_resolution,
     zb.h3_cells                     AS zone_b_cells,
+    zb.departure_hub_name           AS zone_b_departure_hub_name,
+    zb.departure_hub_lat            AS zone_b_departure_hub_lat,
+    zb.departure_hub_lng            AS zone_b_departure_hub_lng,
+    zb.arrival_hub_name             AS zone_b_arrival_hub_name,
+    zb.arrival_hub_lat              AS zone_b_arrival_hub_lat,
+    zb.arrival_hub_lng              AS zone_b_arrival_hub_lng,
+    zb.departure_time               AS zone_b_departure_time,
+    zb.arrival_time                 AS zone_b_arrival_time,
     ua.full_name                    AS transport_a_name,
     ub.full_name                    AS transport_b_name
   FROM zone_connections c
@@ -696,18 +891,34 @@ function parseJsonbPairs(raw: unknown): AdjacentCellPair[] {
   return [];
 }
 
+function parsePartyHub(
+  row: Record<string, unknown>,
+  prefix: string
+): { name: string; lat: number; lng: number } | null {
+  const name = row[`${prefix}_name`];
+  const lat = row[`${prefix}_lat`];
+  const lng = row[`${prefix}_lng`];
+  if (name == null || lat == null || lng == null) return null;
+  const latN = Number(lat);
+  const lngN = Number(lng);
+  if (!Number.isFinite(latN) || !Number.isFinite(lngN)) return null;
+  return { name: String(name).trim(), lat: latN, lng: lngN };
+}
+
 function rowToResponse(row: Record<string, unknown>): ZoneConnectionResponse {
   const transferCells = parseJsonbCells(row.transfer_cells);
   const adjacentPairs = parseJsonbPairs(row.adjacent_cell_pairs);
   return {
     id: Number(row.id),
-    connection_type: String(row.connection_type) as "overlap" | "adjacent",
+    connection_type: String(row.connection_type) as "overlap" | "adjacent" | "hub",
     transfer_cells: transferCells,
     adjacent_cell_pairs: adjacentPairs,
     recommended_transfer_cell:
       row.recommended_transfer_cell == null ? null : String(row.recommended_transfer_cell),
     transport_method_a: row.transport_method_a == null ? null : String(row.transport_method_a),
     transport_method_b: row.transport_method_b == null ? null : String(row.transport_method_b),
+    hub_role_a: (row.hub_role_a == null ? null : String(row.hub_role_a)) as HubRole | null,
+    hub_role_b: (row.hub_role_b == null ? null : String(row.hub_role_b)) as HubRole | null,
     transfer_cell_count: transferCells.length,
     adjacent_pair_count: adjacentPairs.length,
     zone_a: {
@@ -719,6 +930,10 @@ function rowToResponse(row: Record<string, unknown>): ZoneConnectionResponse {
       cell_count: Number(row.zone_a_cell_count ?? 0),
       resolution: Number(row.zone_a_resolution ?? 0),
       cells: parseJsonbCells(row.zone_a_cells),
+      departure_hub: parsePartyHub(row, "zone_a_departure_hub"),
+      arrival_hub: parsePartyHub(row, "zone_a_arrival_hub"),
+      departure_time: row.zone_a_departure_time == null ? null : String(row.zone_a_departure_time),
+      arrival_time: row.zone_a_arrival_time == null ? null : String(row.zone_a_arrival_time),
     },
     zone_b: {
       id: Number(row.zone_b_id),
@@ -729,6 +944,10 @@ function rowToResponse(row: Record<string, unknown>): ZoneConnectionResponse {
       cell_count: Number(row.zone_b_cell_count ?? 0),
       resolution: Number(row.zone_b_resolution ?? 0),
       cells: parseJsonbCells(row.zone_b_cells),
+      departure_hub: parsePartyHub(row, "zone_b_departure_hub"),
+      arrival_hub: parsePartyHub(row, "zone_b_arrival_hub"),
+      departure_time: row.zone_b_departure_time == null ? null : String(row.zone_b_departure_time),
+      arrival_time: row.zone_b_arrival_time == null ? null : String(row.zone_b_arrival_time),
     },
     is_active: Boolean(row.is_active),
     created_at: new Date(String(row.created_at)).toISOString(),

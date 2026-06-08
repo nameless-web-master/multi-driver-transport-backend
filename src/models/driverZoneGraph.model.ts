@@ -22,6 +22,13 @@ export interface GraphPrimaryCoordinate {
   lng: number;
 }
 
+/** A named terminal hub (airport or port) with coordinates. */
+export interface GraphHubTerminal {
+  name: string;
+  lat: number;
+  lng: number;
+}
+
 export interface GraphNode {
   id: string;
   node_type: GraphNodeType;
@@ -42,6 +49,15 @@ export interface GraphNode {
    */
   cells: string[];
   primary_coordinate: GraphPrimaryCoordinate | null;
+  /**
+   * Air/sea routes: the departure + arrival terminals so the graph can draw
+   * the actual route (airport→airport, port→port) instead of a single dot.
+   * Null for land zones.
+   */
+  departure_hub: GraphHubTerminal | null;
+  arrival_hub: GraphHubTerminal | null;
+  departure_time: string | null;
+  arrival_time: string | null;
   is_isolated: boolean;
   component_id: string;
 }
@@ -84,6 +100,7 @@ export interface GraphSummary {
   isolated_zones: number;
   overlap_edges: number;
   adjacent_edges: number;
+  hub_edges: number;
   /** Total components including isolated singletons. */
   total_components_including_isolated: number;
   /** Wall-clock timestamp the snapshot was assembled. */

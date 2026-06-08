@@ -1,6 +1,10 @@
 import { latLngToCell } from "h3-js";
 import { pool } from "../database";
-import type { AdjacentCellPair, ConnectionType } from "../models/zoneConnection.model";
+import type {
+  AdjacentCellPair,
+  ConnectionType,
+  HubRole,
+} from "../models/zoneConnection.model";
 
 /**
  * Milestone 2 — Order draft preview.
@@ -81,6 +85,12 @@ export interface OrderDraftPreviewInput {
   destination_address?: string;
   /** BFS depth limit. Clamped to 1..20. */
   max_depth?: number;
+  /**
+   * How many hops beyond the shortest route an alternative path may take and
+   * still be shown ("slightly winding" allowance). Defaults to
+   * `DEFAULT_EXTRA_HOPS`. Clamped to 0..6.
+   */
+  extra_hops?: number;
 }
 
 export interface OrderDraftZoneSummary {
@@ -102,6 +112,17 @@ export interface OrderDraftZoneSummary {
   is_destination: boolean;
   /** BFS depth from the nearest pickup zone (0 = pickup). null if unreached. */
   depth: number | null;
+  /** Air/sea route terminals (null for land zones) so the map can draw the leg. */
+  departure_hub: OrderDraftHub | null;
+  arrival_hub: OrderDraftHub | null;
+  departure_time: string | null;
+  arrival_time: string | null;
+}
+
+export interface OrderDraftHub {
+  name: string;
+  lat: number;
+  lng: number;
 }
 
 export interface OrderDraftConnection {
@@ -112,6 +133,9 @@ export interface OrderDraftConnection {
   transfer_cells: string[];
   adjacent_cell_pairs: AdjacentCellPair[];
   used_in_preview: boolean;
+  /** For `hub` connections: which terminal of the air/sea side is the handoff. */
+  hub_role_a: HubRole | null;
+  hub_role_b: HubRole | null;
 }
 
 export interface OrderDraftChain {
@@ -168,6 +192,10 @@ interface ZoneMeta {
   transport_mode: string | null;
   resolution: number;
   cell_count: number;
+  departure_hub: OrderDraftHub | null;
+  arrival_hub: OrderDraftHub | null;
+  departure_time: string | null;
+  arrival_time: string | null;
 }
 
 interface ConnectionRow {
@@ -177,6 +205,19 @@ interface ConnectionRow {
   connection_type: ConnectionType;
   transfer_cells: string[];
   adjacent_cell_pairs: AdjacentCellPair[];
+  hub_role_a: HubRole | null;
+  hub_role_b: HubRole | null;
+}
+
+function parseOrderHub(
+  row: Record<string, unknown>,
+  prefix: "departure_hub" | "arrival_hub"
+): OrderDraftHub | null {
+  const name = row[`${prefix}_name`];
+  const lat = Number(row[`${prefix}_lat`]);
+  const lng = Number(row[`${prefix}_lng`]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return { name: name == null ? "" : String(name), lat, lng };
 }
 
 function parseCellsJsonb(raw: unknown): string[] {
@@ -222,6 +263,9 @@ async function loadZoneMeta(): Promise<ZoneMeta[]> {
             z.transport_mode,
             z.resolution,
             jsonb_array_length(z.h3_cells) AS cell_count,
+            z.departure_hub_name, z.departure_hub_lat, z.departure_hub_lng,
+            z.arrival_hub_name, z.arrival_hub_lat, z.arrival_hub_lng,
+            z.departure_time, z.arrival_time,
             u.full_name AS transport_name
      FROM driver_zones z
      JOIN users u ON u.id = z.owner_user_id
@@ -235,6 +279,10 @@ async function loadZoneMeta(): Promise<ZoneMeta[]> {
     transport_mode: row.transport_mode == null ? null : String(row.transport_mode),
     resolution: Number(row.resolution ?? 0),
     cell_count: Number(row.cell_count ?? 0),
+    departure_hub: parseOrderHub(row, "departure_hub"),
+    arrival_hub: parseOrderHub(row, "arrival_hub"),
+    departure_time: row.departure_time == null ? null : String(row.departure_time),
+    arrival_time: row.arrival_time == null ? null : String(row.arrival_time),
   }));
 }
 
@@ -270,7 +318,7 @@ async function findCoveringZoneIdsSql(lat: number, lng: number): Promise<Set<num
 async function loadConnections(): Promise<ConnectionRow[]> {
   const result = await pool.query(
     `SELECT id, zone_a_id, zone_b_id, connection_type,
-            transfer_cells, adjacent_cell_pairs
+            transfer_cells, adjacent_cell_pairs, hub_role_a, hub_role_b
      FROM zone_connections
      WHERE is_active = TRUE`
   );
@@ -281,6 +329,8 @@ async function loadConnections(): Promise<ConnectionRow[]> {
     connection_type: row.connection_type as ConnectionType,
     transfer_cells: parseCellsJsonb(row.transfer_cells),
     adjacent_cell_pairs: parsePairsJsonb(row.adjacent_cell_pairs),
+    hub_role_a: (row.hub_role_a == null ? null : String(row.hub_role_a)) as HubRole | null,
+    hub_role_b: (row.hub_role_b == null ? null : String(row.hub_role_b)) as HubRole | null,
   }));
 }
 
@@ -379,30 +429,152 @@ function bfsFromPickup(
   return { depth, parent, parentEdge, usedConnectionIds };
 }
 
-function reconstructChains(
-  reachedDestinationIds: number[],
-  bfs: BfsState
-): OrderDraftChain[] {
-  const MAX_CHAINS = 6;
-  const chains: OrderDraftChain[] = [];
-  for (const destId of reachedDestinationIds) {
-    if (!bfs.depth.has(destId)) continue;
-    const zoneIds: number[] = [destId];
-    const connectionIds: number[] = [];
-    let cursor: number | undefined = destId;
-    while (cursor != null && bfs.parent.has(cursor)) {
-      const parentZone: number = bfs.parent.get(cursor)!;
-      const edgeId = bfs.parentEdge.get(cursor);
-      if (edgeId != null) connectionIds.unshift(edgeId);
-      zoneIds.unshift(parentZone);
-      cursor = parentZone;
+/**
+ * Multi-source BFS that returns, for every reachable zone, the minimum
+ * number of hops to the *nearest* zone in `sources`. Used as an admissible
+ * lower bound when enumerating paths so we can prune branches that could
+ * never reach a destination within the hop budget.
+ */
+function minHopsToAny(
+  sources: number[],
+  adjacency: Map<number, { neighbour: number; connection: ConnectionRow }[]>,
+  maxDepth: number
+): Map<number, number> {
+  const dist = new Map<number, number>();
+  const queue: number[] = [];
+  for (const s of sources) {
+    if (!dist.has(s)) {
+      dist.set(s, 0);
+      queue.push(s);
     }
-    chains.push({ zone_ids: zoneIds, connection_ids: connectionIds, hops: connectionIds.length });
-    if (chains.length >= MAX_CHAINS) break;
   }
-  chains.sort((a, b) => a.hops - b.hops);
-  return chains;
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const d = dist.get(current)!;
+    if (d >= maxDepth) continue;
+    for (const { neighbour } of adjacency.get(current) ?? []) {
+      if (!dist.has(neighbour)) {
+        dist.set(neighbour, d + 1);
+        queue.push(neighbour);
+      }
+    }
+  }
+  return dist;
 }
+
+/**
+ * Extra hops beyond the shortest pickup→destination distance that a path is
+ * still allowed to take. Keeps "slightly winding" alternatives while
+ * discarding routes that would feel absurdly roundabout.
+ */
+const DEFAULT_EXTRA_HOPS = 2;
+
+/** Safety caps so a dense graph can't blow up the enumeration. */
+const MAX_PREVIEW_CHAINS = 25;
+const MAX_ENUMERATION_STEPS = 200_000;
+
+interface EnumeratedChains {
+  chains: OrderDraftChain[];
+  usedConnectionIds: Set<number>;
+  zoneIds: Set<number>;
+}
+
+/**
+ * Enumerate *all* simple pickup→destination paths whose length stays within
+ * `shortest + extraHops` hops. Unlike the old BFS-tree reconstruction (one
+ * path per destination), this surfaces every reasonable alternative the
+ * sender could be routed through.
+ *
+ * Pruning: a partial path at `current` with `hopsSoFar` hops is abandoned as
+ * soon as `hopsSoFar + minHopsToDest(current) > hopBudget`, so we never walk
+ * down branches that can't finish on budget. Simple-path (no zone revisited)
+ * keeps it finite; the step/chain caps bound the worst case.
+ */
+function enumerateChains(
+  pickupZoneIds: number[],
+  destSet: Set<number>,
+  adjacency: Map<number, { neighbour: number; connection: ConnectionRow }[]>,
+  maxDepth: number,
+  extraHops: number
+): EnumeratedChains {
+  const chains: OrderDraftChain[] = [];
+  const usedConnectionIds = new Set<number>();
+  const zoneIds = new Set<number>();
+
+  const distToDest = minHopsToAny(Array.from(destSet), adjacency, maxDepth);
+
+  let shortest = Infinity;
+  for (const p of pickupZoneIds) {
+    const d = distToDest.get(p);
+    if (d != null && d < shortest) shortest = d;
+  }
+  if (!Number.isFinite(shortest)) return { chains, usedConnectionIds, zoneIds };
+
+  const hopBudget = Math.min(maxDepth, shortest + Math.max(0, extraHops));
+
+  const visited = new Set<number>();
+  const zonePath: number[] = [];
+  const edgePath: number[] = [];
+  let steps = 0;
+
+  function record() {
+    chains.push({
+      zone_ids: [...zonePath],
+      connection_ids: [...edgePath],
+      hops: edgePath.length,
+    });
+    for (const e of edgePath) usedConnectionIds.add(e);
+    for (const z of zonePath) zoneIds.add(z);
+  }
+
+  function dfs(current: number): void {
+    if (chains.length >= MAX_PREVIEW_CHAINS || steps >= MAX_ENUMERATION_STEPS) return;
+    steps++;
+
+    // Destinations are terminal — stop extending so we don't manufacture
+    // routes that pass *through* one destination on the way to another.
+    if (destSet.has(current)) {
+      record();
+      return;
+    }
+
+    for (const { neighbour, connection } of adjacency.get(current) ?? []) {
+      if (visited.has(neighbour)) continue;
+      const remaining = distToDest.get(neighbour);
+      if (remaining == null) continue; // neighbour can't reach any destination
+      if (edgePath.length + 1 + remaining > hopBudget) continue; // too roundabout
+
+      visited.add(neighbour);
+      zonePath.push(neighbour);
+      edgePath.push(connection.id);
+      dfs(neighbour);
+      edgePath.pop();
+      zonePath.pop();
+      visited.delete(neighbour);
+
+      if (chains.length >= MAX_PREVIEW_CHAINS || steps >= MAX_ENUMERATION_STEPS) return;
+    }
+  }
+
+  for (const p of pickupZoneIds) {
+    if (distToDest.get(p) == null) continue;
+    visited.add(p);
+    zonePath.push(p);
+    dfs(p);
+    zonePath.pop();
+    visited.delete(p);
+    if (chains.length >= MAX_PREVIEW_CHAINS) break;
+  }
+
+  // Shortest first, then fewer zones, so the UI lists the cleanest routes up top.
+  chains.sort((a, b) => a.hops - b.hops || a.zone_ids.length - b.zone_ids.length);
+  return { chains, usedConnectionIds, zoneIds };
+}
+
+// NOTE: `bfsFromPickup` is still used to compute each zone's depth (distance
+// from the nearest pickup) for ordering/labelling. The single-path
+// `reconstructChains` helper it used to feed has been replaced by
+// `enumerateChains`, which surfaces every reasonable route.
 
 function describeStatus(
   pickupCount: number,
@@ -429,7 +601,7 @@ function describeStatus(
       status: "connected",
       message: `Pickup and destination are linked through ${connectedCount} transport zone${
         connectedCount === 1 ? "" : "s"
-      } via overlap or adjacency.`,
+      } via land overlap, adjacency, or airport/port hub transfers.`,
     };
   }
   return {
@@ -458,6 +630,10 @@ function zoneMetaToSummary(
     is_pickup: isPickup,
     is_destination: isDestination,
     depth,
+    departure_hub: z.departure_hub,
+    arrival_hub: z.arrival_hub,
+    departure_time: z.departure_time,
+    arrival_time: z.arrival_time,
   };
 }
 
@@ -474,6 +650,7 @@ export async function previewOrderZoneConnectionsByCoordinates(
   input: OrderDraftPreviewInput
 ): Promise<OrderDraftPreview> {
   const maxDepth = Math.max(1, Math.min(20, input.max_depth ?? DEFAULT_PREVIEW_MAX_DEPTH));
+  const extraHops = Math.max(0, Math.min(6, input.extra_hops ?? DEFAULT_EXTRA_HOPS));
   // Display-only resolution: scale the pickup / drop-off cell size to the
   // distance between them so the hexagons stay visible when the map fits
   // both ends. Persisted order H3 still uses ORDER_H3_RESOLUTION elsewhere.
@@ -525,16 +702,29 @@ export async function previewOrderZoneConnectionsByCoordinates(
 
   const pickupZones = pickZones(pickupIds, zoneById);
   const destinationZones = pickZones(destIds, zoneById);
+  // Depth (distance from the nearest pickup) is still useful for ordering /
+  // labelling each zone, so we keep the cheap BFS for that.
   const bfs = bfsFromPickup(Array.from(pickupIds), adjacency, maxDepth);
+  // …but the actual routes shown to the sender now come from full path
+  // enumeration so *every* reasonable pickup→destination chain is surfaced.
+  const enumerated = enumerateChains(
+    Array.from(pickupIds),
+    destIds,
+    adjacency,
+    maxDepth,
+    extraHops
+  );
+  const chains = enumerated.chains;
+  const usedConnectionIds = enumerated.usedConnectionIds;
+  const isConnected = chains.length > 0;
 
-  // Pre-compute the surfaced zone id list, then fetch their cells in ONE
-  // targeted query. We attach the (sampled) cell list back to each summary
-  // so the front-end map can render zone outlines without a second round
-  // trip.
+  // Surface pickup + destination zones plus every zone that appears on a
+  // possible route. We deliberately do NOT surface all BFS-reachable zones
+  // anymore — only the ones the sender could actually be routed through.
   const surfacedIds = new Set<number>();
   pickupIds.forEach((id) => surfacedIds.add(id));
   destIds.forEach((id) => surfacedIds.add(id));
-  bfs.depth.forEach((_, id) => surfacedIds.add(id));
+  enumerated.zoneIds.forEach((id) => surfacedIds.add(id));
   const cellsByZone = await loadCellsForZoneIds(Array.from(surfacedIds));
 
   const summaryById = new Map<number, OrderDraftZoneSummary>();
@@ -554,15 +744,13 @@ export async function previewOrderZoneConnectionsByCoordinates(
       )
     );
   }
-  pickupIds.forEach(add);
-  bfs.depth.forEach((_, id) => add(id));
-  destIds.forEach(add);
+  surfacedIds.forEach(add);
 
   const connectionList: OrderDraftConnection[] = [];
   const transferCellSet = new Set<string>();
   for (const c of connections) {
     if (!summaryById.has(c.zone_a_id) || !summaryById.has(c.zone_b_id)) continue;
-    const used = bfs.usedConnectionIds.has(c.id);
+    const used = usedConnectionIds.has(c.id);
     connectionList.push({
       id: c.id,
       from_zone_id: c.zone_a_id,
@@ -571,16 +759,14 @@ export async function previewOrderZoneConnectionsByCoordinates(
       transfer_cells: c.transfer_cells,
       adjacent_cell_pairs: c.adjacent_cell_pairs,
       used_in_preview: used,
+      hub_role_a: c.hub_role_a,
+      hub_role_b: c.hub_role_b,
     });
     if (used) c.transfer_cells.forEach((cell) => transferCellSet.add(cell));
   }
   connectionList.sort((a, b) =>
     a.used_in_preview === b.used_in_preview ? a.id - b.id : a.used_in_preview ? -1 : 1
   );
-
-  const reachedDestinationIds = Array.from(destIds).filter((id) => bfs.depth.has(id));
-  const isConnected = reachedDestinationIds.length > 0;
-  const chains = isConnected ? reconstructChains(reachedDestinationIds, bfs) : [];
 
   const { status, message } = describeStatus(
     pickupZones.length,

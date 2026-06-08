@@ -37,14 +37,16 @@ function buildPoolConfig(): PoolConfig {
    * - idleTimeoutMillis: recycle pool clients ourselves *before* the
    *   server kills them, so we don't hand out half-dead sockets.
    * - connectionTimeoutMillis: bound how long a single connect attempt
-   *   can hang on a slow / unreachable remote DB.
+   *   can hang on a slow / unreachable remote DB. Kept generous (30s) because
+   *   managed free tiers (Render, etc.) spin the DB down when idle and a cold
+   *   start over a high-latency link can take well past 10s.
    * - statement_timeout: prevent a single runaway query from holding a
    *   client forever.
    */
   const shared: Partial<PoolConfig> = {
     max: Number(process.env.PG_POOL_MAX) || 5,
     idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS) || 30_000,
-    connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS) || 10_000,
+    connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS) || 30_000,
     keepAlive: true,
     keepAliveInitialDelayMillis: 10_000,
     statement_timeout: Number(process.env.PG_STATEMENT_TIMEOUT_MS) || 15_000,
@@ -184,6 +186,17 @@ export async function ensureSchema(): Promise<void> {
     // Backfill transport_mode from the existing array, defaulting to 'land'.
     await client.query(`UPDATE driver_zones SET transport_mode = COALESCE(transport_mode, transport_modes[1], 'land') WHERE transport_mode IS NULL OR transport_mode = '';`);
 
+    // Air/sea routes: explicit departure + arrival hub terminals (point-based,
+    // not area coverage). Land zones leave these NULL.
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS departure_hub_name TEXT;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS departure_hub_lat DOUBLE PRECISION;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS departure_hub_lng DOUBLE PRECISION;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS arrival_hub_name TEXT;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS arrival_hub_lat DOUBLE PRECISION;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS arrival_hub_lng DOUBLE PRECISION;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS departure_time TEXT;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS arrival_time TEXT;`);
+
     await client.query(`CREATE INDEX IF NOT EXISTS idx_driver_zones_owner_user_id ON driver_zones (owner_user_id);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_driver_zones_h3_cells ON driver_zones USING GIN (h3_cells);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_driver_zones_resolution ON driver_zones (resolution);`);
@@ -300,10 +313,20 @@ export async function ensureSchema(): Promise<void> {
         created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CONSTRAINT zone_connections_no_self CHECK (zone_a_id <> zone_b_id),
-        CONSTRAINT zone_connections_type_check CHECK (connection_type IN ('overlap', 'adjacent')),
+        CONSTRAINT zone_connections_type_check CHECK (connection_type IN ('overlap', 'adjacent', 'hub')),
         CONSTRAINT zone_connections_unique UNIQUE (zone_a_id, zone_b_id)
       );
     `);
+    // Air/sea handoffs are point-based: a land zone connects to an air/sea
+    // zone at its departure or arrival hub. `hub_role_a` / `hub_role_b` record
+    // which hub of that side anchors the connection (NULL for land zones).
+    await client.query(`ALTER TABLE zone_connections ADD COLUMN IF NOT EXISTS hub_role_a TEXT;`);
+    await client.query(`ALTER TABLE zone_connections ADD COLUMN IF NOT EXISTS hub_role_b TEXT;`);
+    // Existing DBs were created with the 2-value check; widen it to allow 'hub'.
+    await client.query(`ALTER TABLE zone_connections DROP CONSTRAINT IF EXISTS zone_connections_type_check;`);
+    await client.query(
+      `ALTER TABLE zone_connections ADD CONSTRAINT zone_connections_type_check CHECK (connection_type IN ('overlap', 'adjacent', 'hub'));`
+    );
     // Milestone 2 (updated scope): one recommended transfer cell per
     // connection. Chosen from `transfer_cells` (overlap) or the adjacent
     // pairs (adjacency) using the midpoint-of-centroids rule in

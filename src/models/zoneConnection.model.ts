@@ -9,8 +9,12 @@
  * Overlap is stronger and is preferred when both conditions hold.
  */
 
-export const CONNECTION_TYPES = ["overlap", "adjacent"] as const;
+export const CONNECTION_TYPES = ["overlap", "adjacent", "hub"] as const;
 export type ConnectionType = (typeof CONNECTION_TYPES)[number];
+
+/** Which hub of an air/sea zone anchors a hub connection. */
+export const HUB_ROLES = ["departure", "arrival"] as const;
+export type HubRole = (typeof HUB_ROLES)[number];
 
 export interface AdjacentCellPair {
   from_cell: string;
@@ -29,6 +33,9 @@ export interface ZoneConnectionRow {
   recommended_transfer_cell: string | null;
   transport_method_a: string | null;
   transport_method_b: string | null;
+  /** Hub anchor for air/sea sides; null when that side is a land zone. */
+  hub_role_a: HubRole | null;
+  hub_role_b: HubRole | null;
   is_active: boolean;
   created_at: Date;
   updated_at: Date;

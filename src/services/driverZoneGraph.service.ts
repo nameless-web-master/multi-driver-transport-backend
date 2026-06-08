@@ -66,6 +66,14 @@ interface ZoneRow {
   transport_mode: string | null;
   boundary: unknown;
   transport_name: string;
+  departure_hub_name: string | null;
+  departure_hub_lat: number | null;
+  departure_hub_lng: number | null;
+  arrival_hub_name: string | null;
+  arrival_hub_lat: number | null;
+  arrival_hub_lng: number | null;
+  departure_time: string | null;
+  arrival_time: string | null;
 }
 
 interface ConnectionRow {
@@ -185,10 +193,22 @@ function componentIdFor(index: number): string {
  * in later by `detectConnectedComponents`; until then the node carries the
  * placeholder "component_unassigned" so the field is always populated.
  */
+function hubTerminal(
+  name: string | null,
+  lat: number | null,
+  lng: number | null
+): { name: string; lat: number; lng: number } | null {
+  if (lat == null || lng == null) return null;
+  if (!Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) return null;
+  return { name: (name ?? "").trim(), lat: Number(lat), lng: Number(lng) };
+}
+
 export function buildNode(row: ZoneRow): GraphNode {
   const cells = parseCellArray(row.h3_cells);
   const hasBoundary = parseBoundary(row.boundary);
   const zoneType: GraphZoneType = hasBoundary ? "geofence" : "h3";
+  const departureHub = hubTerminal(row.departure_hub_name, row.departure_hub_lat, row.departure_hub_lng);
+  const arrivalHub = hubTerminal(row.arrival_hub_name, row.arrival_hub_lat, row.arrival_hub_lng);
   return {
     id: zoneNodeId(row.id),
     node_type: "transport_zone",
@@ -201,7 +221,11 @@ export function buildNode(row: ZoneRow): GraphNode {
     h3_cell_count: cells.length,
     resolution: Number.isFinite(Number(row.resolution)) ? Number(row.resolution) : 0,
     cells,
-    primary_coordinate: primaryCoordinateFor(cells),
+    primary_coordinate: departureHub ?? primaryCoordinateFor(cells),
+    departure_hub: departureHub,
+    arrival_hub: arrivalHub,
+    departure_time: row.departure_time == null ? null : String(row.departure_time),
+    arrival_time: row.arrival_time == null ? null : String(row.arrival_time),
     is_isolated: false,
     component_id: "component_unassigned",
   };
@@ -385,6 +409,7 @@ export function getGraphSummary(
 ): GraphSummary {
   const overlapEdges = edges.filter((e) => e.connection_type === "overlap").length;
   const adjacentEdges = edges.filter((e) => e.connection_type === "adjacent").length;
+  const hubEdges = edges.filter((e) => e.connection_type === "hub").length;
   // "Connected components" in the spec's summary means *multi-node* groups —
   // a single isolated zone is reported in `isolated_zones` instead. We also
   // surface a total count (including singletons) for completeness.
@@ -396,6 +421,7 @@ export function getGraphSummary(
     isolated_zones: isolatedNodes.length,
     overlap_edges: overlapEdges,
     adjacent_edges: adjacentEdges,
+    hub_edges: hubEdges,
     total_components_including_isolated: components.length,
     generated_at: new Date().toISOString(),
   };
@@ -408,6 +434,9 @@ export function getGraphSummary(
 const ZONE_SELECT = `
   SELECT z.id, z.owner_user_id, z.zone_name, z.resolution, z.h3_cells,
          z.transport_mode, z.boundary,
+         z.departure_hub_name, z.departure_hub_lat, z.departure_hub_lng,
+         z.arrival_hub_name, z.arrival_hub_lat, z.arrival_hub_lng,
+         z.departure_time, z.arrival_time,
          COALESCE(u.full_name, '') AS transport_name
   FROM driver_zones z
   LEFT JOIN users u ON u.id = z.owner_user_id
@@ -423,15 +452,27 @@ const CONNECTION_SELECT = `
   WHERE c.is_active = TRUE
 `;
 
-async function fetchZonesForScope(ctx: GraphAccess): Promise<ZoneRow[]> {
+/**
+ * Minimal shape shared by `pg`'s `Pool` and `PoolClient`. Letting the scope
+ * helpers accept either means `buildGraph` can run its two reads on a single
+ * acquired client (one connection, sequential) instead of forcing the pool to
+ * open two fresh connections at once — which can blow past
+ * `connectionTimeoutMillis` against a cold/slow remote DB.
+ */
+type Queryable = Pick<typeof pool, "query">;
+
+async function fetchZonesForScope(
+  ctx: GraphAccess,
+  db: Queryable = pool
+): Promise<ZoneRow[]> {
   // Drivers see their own zones plus any zone that is connected to one
   // of theirs. Privileged roles see everything.
   if (isPrivilegedRole(ctx.role)) {
-    const result = await pool.query(`${ZONE_SELECT} ORDER BY z.id`);
+    const result = await db.query(`${ZONE_SELECT} ORDER BY z.id`);
     return result.rows as ZoneRow[];
   }
   if (ctx.role === "driver") {
-    const result = await pool.query(
+    const result = await db.query(
       `${ZONE_SELECT}
          AND (
            z.owner_user_id = $1
@@ -452,13 +493,16 @@ async function fetchZonesForScope(ctx: GraphAccess): Promise<ZoneRow[]> {
   return [];
 }
 
-async function fetchConnectionsForScope(ctx: GraphAccess): Promise<ConnectionRow[]> {
+async function fetchConnectionsForScope(
+  ctx: GraphAccess,
+  db: Queryable = pool
+): Promise<ConnectionRow[]> {
   if (isPrivilegedRole(ctx.role)) {
-    const result = await pool.query(`${CONNECTION_SELECT} ORDER BY c.id`);
+    const result = await db.query(`${CONNECTION_SELECT} ORDER BY c.id`);
     return result.rows as ConnectionRow[];
   }
   if (ctx.role === "driver") {
-    const result = await pool.query(
+    const result = await db.query(
       `${CONNECTION_SELECT}
          AND (c.transport_a_id = $1 OR c.transport_b_id = $1)
        ORDER BY c.id`,
@@ -483,10 +527,19 @@ async function fetchConnectionsForScope(ctx: GraphAccess): Promise<ConnectionRow
  *   - Compute summary
  */
 export async function buildGraph(ctx: GraphAccess): Promise<DriverZoneGraph> {
-  const [zoneRows, connectionRows] = await Promise.all([
-    fetchZonesForScope(ctx),
-    fetchConnectionsForScope(ctx),
-  ]);
+  // Run both reads on a single pooled client, one after the other. This needs
+  // exactly one connection (vs. two concurrent ones with Promise.all), which
+  // avoids "timeout exceeded when trying to connect" when the remote DB is
+  // cold/slow and opening a second simultaneous connection would stall.
+  const client = await pool.connect();
+  let zoneRows: ZoneRow[];
+  let connectionRows: ConnectionRow[];
+  try {
+    zoneRows = await fetchZonesForScope(ctx, client);
+    connectionRows = await fetchConnectionsForScope(ctx, client);
+  } finally {
+    client.release();
+  }
 
   const nodes = buildNodes(zoneRows);
   const nodeIdSet = new Set(nodes.map((n) => n.id));

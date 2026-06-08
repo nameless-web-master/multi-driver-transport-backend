@@ -69,6 +69,7 @@ zoneConnectionsRouter.post("/recalculate", async (req: AuthenticatedRequest, res
       total_connections: stats.total_connections,
       overlap_connections: stats.overlap_connections,
       adjacent_connections: stats.adjacent_connections,
+      hub_connections: stats.hub_connections,
       zones_compared: stats.zones_compared,
     });
   } catch (err) {

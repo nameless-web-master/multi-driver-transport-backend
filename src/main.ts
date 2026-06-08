@@ -91,6 +91,15 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 
 async function bootstrap() {
   await ensureSchema();
+  // Warm the land-polygon mask used by sea routing so the first sea-route
+  // request doesn't pay the file-load cost mid-request.
+  try {
+    const { ensureLandMaskLoaded } = await import("./services/landMask.service");
+    ensureLandMaskLoaded();
+    console.log("[sea-route] land mask ready");
+  } catch (err) {
+    console.error("[sea-route] land mask preload failed:", err);
+  }
   // Backfill H3 indexes for pre-existing orders (best-effort; never blocks
   // startup if it fails — new orders compute H3 at creation time anyway).
   try {

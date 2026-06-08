@@ -6,6 +6,13 @@ export interface LatLngPoint {
   lng: number;
 }
 
+/** A named terminal hub (airport or port) with coordinates. */
+export interface HubTerminal {
+  name: string;
+  lat: number;
+  lng: number;
+}
+
 export interface DriverZoneRow {
   id: number;
   owner_user_id: number;
@@ -15,6 +22,12 @@ export interface DriverZoneRow {
   h3_cells: string[];
   transport_mode: TransportMode;
   boundary: LatLngPoint[] | null;
+  /** Departure terminal — required for air/sea routes. */
+  departure_hub: HubTerminal | null;
+  /** Arrival terminal — required for air/sea routes. */
+  arrival_hub: HubTerminal | null;
+  departure_time: string | null;
+  arrival_time: string | null;
   rate_cost: number;
   currency: Currency;
   available: boolean;
@@ -31,6 +44,10 @@ export interface DriverZoneCreateInput {
   h3_cells: string[];
   transport_mode: TransportMode;
   boundary?: LatLngPoint[] | null;
+  departure_hub?: HubTerminal | null;
+  arrival_hub?: HubTerminal | null;
+  departure_time?: string | null;
+  arrival_time?: string | null;
   rate_cost: number;
   currency: Currency;
   available: boolean;
@@ -44,6 +61,10 @@ export interface DriverZoneUpdateInput {
   h3_cells?: string[];
   transport_mode?: TransportMode;
   boundary?: LatLngPoint[] | null;
+  departure_hub?: HubTerminal | null;
+  arrival_hub?: HubTerminal | null;
+  departure_time?: string | null;
+  arrival_time?: string | null;
   rate_cost?: number;
   currency?: Currency;
   available?: boolean;
