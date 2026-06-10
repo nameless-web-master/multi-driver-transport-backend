@@ -70,10 +70,12 @@ ordersRouter.post(
       });
     }
     const c = ctx(req);
-    if (c.role !== "sender" && c.role !== "admin") {
+    // Milestone 4 — a sender *or* receiver can request the possible routes for
+    // a draft order; admins can too. Drivers manage zones, not route requests.
+    if (c.role !== "sender" && c.role !== "receiver" && c.role !== "admin") {
       return res
         .status(403)
-        .json({ error: "Only senders and admins can preview a draft order" });
+        .json({ error: "Only senders, receivers, and admins can request draft routes" });
     }
     try {
       const preview = await previewOrderZoneConnectionsByCoordinates({

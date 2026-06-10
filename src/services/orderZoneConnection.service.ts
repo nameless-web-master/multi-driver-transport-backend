@@ -1,4 +1,4 @@
-import { latLngToCell } from "h3-js";
+import { cellToLatLng, isValidCell, latLngToCell } from "h3-js";
 import { pool } from "../database";
 import type {
   AdjacentCellPair,
@@ -144,6 +144,32 @@ export interface OrderDraftChain {
   hops: number;
 }
 
+/**
+ * Milestone 4 — what we surface when no *complete* pickup→destination route
+ * exists. `pickup_chain` is how far the order can travel from the pickup side
+ * (the incomplete route), `destination_chain` is the slice that can reach the
+ * destination, and the two frontier zones plus `distance_km` describe the gap
+ * a new/extended transport zone would need to close.
+ */
+export interface OrderDraftGap {
+  /** Last zone reachable from the pickup side (frontier of the incomplete route). */
+  pickup_frontier_zone_id: number | null;
+  /** Closest zone on the destination side to that pickup frontier. */
+  destination_frontier_zone_id: number | null;
+  /** Straight-line distance between the two frontier zones (km), rounded. */
+  distance_km: number | null;
+  /** Incomplete route pickup → … → pickup frontier. */
+  pickup_chain: OrderDraftChain | null;
+  /** Incomplete route destination frontier → … → drop-off. */
+  destination_chain: OrderDraftChain | null;
+  /** Name of the transporter whose zone is nearest the gap (suggested handoff). */
+  suggested_transport_name: string | null;
+  /** Name of the zone nearest the gap. */
+  suggested_zone_name: string | null;
+  /** Human-readable explanation + suggestion for the sender. */
+  message: string;
+}
+
 export interface OrderDraftPreview {
   source: {
     name: string;
@@ -170,6 +196,13 @@ export interface OrderDraftPreview {
   status: OrderConnectionStatus;
   message: string;
   possible_connection_chains: OrderDraftChain[];
+  /**
+   * Milestone 4 — populated only when there is no complete route but both
+   * sides have at least one covering zone. Carries the incomplete routes and
+   * the nearest gap suggestion. `null` when a full route exists or a side has
+   * no covering zone at all.
+   */
+  gap: OrderDraftGap | null;
 }
 
 // --------------------------------------------------------------------------
@@ -480,6 +513,18 @@ interface EnumeratedChains {
 }
 
 /**
+ * Which terminal (departure/arrival) of an air/sea zone a connection attaches
+ * to. Hub connections only ever carry a role on the air/sea side, so this is
+ * non-null exactly when `zoneId` is the hub zone of `conn`. Returns null for
+ * land zones and land↔land connections.
+ */
+function hubTerminalOf(conn: ConnectionRow, zoneId: number): HubRole | null {
+  if (conn.zone_a_id === zoneId) return conn.hub_role_a;
+  if (conn.zone_b_id === zoneId) return conn.hub_role_b;
+  return null;
+}
+
+/**
  * Enumerate *all* simple pickup→destination paths whose length stays within
  * `shortest + extraHops` hops. Unlike the old BFS-tree reconstruction (one
  * path per destination), this surfaces every reasonable alternative the
@@ -527,7 +572,9 @@ function enumerateChains(
     for (const z of zonePath) zoneIds.add(z);
   }
 
-  function dfs(current: number): void {
+  // `entryConn` is the connection the path used to arrive at `current` (undefined
+  // for the pickup zone where the path starts).
+  function dfs(current: number, entryConn: ConnectionRow | undefined): void {
     if (chains.length >= MAX_PREVIEW_CHAINS || steps >= MAX_ENUMERATION_STEPS) return;
     steps++;
 
@@ -538,8 +585,19 @@ function enumerateChains(
       return;
     }
 
+    // If we arrived at an air/sea zone via one of its terminals, the only way
+    // out that actually *uses* the flight/voyage is via the OTHER terminal.
+    // Leaving through the same terminal means the leg between departure and
+    // arrival is never travelled, so the air/sea zone is pointless on this
+    // route — skip those exits entirely.
+    const entryTerminal = entryConn ? hubTerminalOf(entryConn, current) : null;
+
     for (const { neighbour, connection } of adjacency.get(current) ?? []) {
       if (visited.has(neighbour)) continue;
+      if (entryTerminal != null) {
+        const exitTerminal = hubTerminalOf(connection, current);
+        if (exitTerminal != null && exitTerminal === entryTerminal) continue;
+      }
       const remaining = distToDest.get(neighbour);
       if (remaining == null) continue; // neighbour can't reach any destination
       if (edgePath.length + 1 + remaining > hopBudget) continue; // too roundabout
@@ -547,7 +605,7 @@ function enumerateChains(
       visited.add(neighbour);
       zonePath.push(neighbour);
       edgePath.push(connection.id);
-      dfs(neighbour);
+      dfs(neighbour, connection);
       edgePath.pop();
       zonePath.pop();
       visited.delete(neighbour);
@@ -560,7 +618,7 @@ function enumerateChains(
     if (distToDest.get(p) == null) continue;
     visited.add(p);
     zonePath.push(p);
-    dfs(p);
+    dfs(p, undefined);
     zonePath.pop();
     visited.delete(p);
     if (chains.length >= MAX_PREVIEW_CHAINS) break;
@@ -575,6 +633,192 @@ function enumerateChains(
 // from the nearest pickup) for ordering/labelling. The single-path
 // `reconstructChains` helper it used to feed has been replaced by
 // `enumerateChains`, which surfaces every reasonable route.
+
+// --------------------------------------------------------------------------
+// Milestone 4 — incomplete routes & nearest-gap suggestion
+// --------------------------------------------------------------------------
+
+/** Hard cap on how many zones we consider when searching for the nearest gap. */
+const MAX_GAP_CANDIDATES = 150;
+
+/** Cheap centroid from a sample of a zone's H3 cells. */
+function centroidOfCells(cells: readonly string[]): { lat: number; lng: number } | null {
+  let latSum = 0;
+  let lngSum = 0;
+  let count = 0;
+  for (const cell of cells) {
+    if (!isValidCell(cell)) continue;
+    try {
+      const [lat, lng] = cellToLatLng(cell);
+      if (Number.isFinite(lat) && Number.isFinite(lng)) {
+        latSum += lat;
+        lngSum += lng;
+        count++;
+      }
+    } catch {
+      /* skip */
+    }
+  }
+  if (count === 0) return null;
+  return { lat: latSum / count, lng: lngSum / count };
+}
+
+/**
+ * Load an approximate centroid for each zone id. Only a small slice of each
+ * zone's `h3_cells` is pulled (LIMIT in SQL) so this stays cheap even for
+ * geofence zones with tens of thousands of cells — we only need a rough
+ * centre to measure the gap between two zones.
+ */
+async function loadZoneCentroids(
+  ids: number[]
+): Promise<Map<number, { lat: number; lng: number }>> {
+  const out = new Map<number, { lat: number; lng: number }>();
+  if (ids.length === 0) return out;
+  const result = await pool.query(
+    `SELECT z.id,
+            COALESCE(
+              (SELECT jsonb_agg(elem)
+               FROM jsonb_array_elements_text(z.h3_cells)
+                 WITH ORDINALITY AS t(elem, ord)
+               WHERE ord <= 80),
+              '[]'::jsonb
+            ) AS sample
+     FROM driver_zones z
+     WHERE z.id = ANY($1::int[])`,
+    [ids]
+  );
+  for (const row of result.rows) {
+    const centroid = centroidOfCells(parseCellsJsonb(row.sample));
+    if (centroid) out.set(Number(row.id), centroid);
+  }
+  return out;
+}
+
+/**
+ * Reconstruct the chain `source → … → target` from a BFS parent tree.
+ * Returns `null` if the target was never reached from any source.
+ */
+function reconstructChain(target: number, bfs: BfsState): OrderDraftChain | null {
+  if (!bfs.depth.has(target)) return null;
+  const zones: number[] = [];
+  const edges: number[] = [];
+  const guard = new Set<number>();
+  let cur: number | undefined = target;
+  while (cur != null && !guard.has(cur)) {
+    guard.add(cur);
+    zones.push(cur);
+    if (!bfs.parent.has(cur)) break;
+    const edge = bfs.parentEdge.get(cur);
+    if (edge != null) edges.push(edge);
+    cur = bfs.parent.get(cur);
+  }
+  zones.reverse();
+  edges.reverse();
+  return { zone_ids: zones, connection_ids: edges, hops: edges.length };
+}
+
+function reverseChain(chain: OrderDraftChain): OrderDraftChain {
+  return {
+    zone_ids: [...chain.zone_ids].reverse(),
+    connection_ids: [...chain.connection_ids].reverse(),
+    hops: chain.hops,
+  };
+}
+
+/** Closest centroid pair across the pickup-side and destination-side zones. */
+function nearestZonePair(
+  pickupSide: number[],
+  destSide: number[],
+  centroids: Map<number, { lat: number; lng: number }>
+): { from: number; to: number; km: number } | null {
+  let best: { from: number; to: number; km: number } | null = null;
+  for (const p of pickupSide) {
+    const cp = centroids.get(p);
+    if (!cp) continue;
+    for (const d of destSide) {
+      const cd = centroids.get(d);
+      if (!cd) continue;
+      const km = haversineKm(cp.lat, cp.lng, cd.lat, cd.lng);
+      if (!best || km < best.km) best = { from: p, to: d, km };
+    }
+  }
+  return best;
+}
+
+/**
+ * When no complete route exists, walk the graph from both ends to find:
+ *  - how far the order can travel from the pickup side (the incomplete route),
+ *  - which destination-side zone gets closest to that frontier,
+ *  - the straight-line gap between them and a suggested zone to bridge it.
+ */
+async function buildGap(
+  pickupIds: Set<number>,
+  destIds: Set<number>,
+  adjacency: Map<number, { neighbour: number; connection: ConnectionRow }[]>,
+  zoneById: Map<number, ZoneMeta>,
+  maxDepth: number
+): Promise<OrderDraftGap | null> {
+  const pickupBfs = bfsFromPickup(Array.from(pickupIds), adjacency, maxDepth);
+  const destBfs = bfsFromPickup(Array.from(destIds), adjacency, maxDepth);
+
+  let pickupSide = Array.from(pickupBfs.depth.keys());
+  let destSide = Array.from(destBfs.depth.keys());
+
+  // Keep the nearest-pair search bounded: if either frontier is huge, fall
+  // back to just the covering zones as anchors.
+  if (pickupSide.length + destSide.length > MAX_GAP_CANDIDATES) {
+    pickupSide = Array.from(pickupIds);
+    destSide = Array.from(destIds);
+  }
+
+  // A zone can sit on both frontiers when the only pickup→destination path is
+  // longer than the BFS budget (so `enumerateChains` reported "not connected"
+  // even though the two sides technically meet). Drop those overlaps from the
+  // destination side so the suggested gap is always between two genuinely
+  // separated zones — never a misleading 0 km "gap" on the same zone.
+  const pickupSet = new Set(pickupSide);
+  destSide = destSide.filter((id) => !pickupSet.has(id));
+  if (destSide.length === 0) return null;
+
+  const centroidIds = Array.from(new Set([...pickupSide, ...destSide]));
+  const centroids = await loadZoneCentroids(centroidIds);
+  const pair = nearestZonePair(pickupSide, destSide, centroids);
+  if (!pair) return null;
+
+  const pickupChain = reconstructChain(pair.from, pickupBfs);
+  const destChainRaw = reconstructChain(pair.to, destBfs);
+  // `destChainRaw` runs destination-source → frontier; flip it so the UI can
+  // read it as "frontier → … → drop-off".
+  const destChain = destChainRaw ? reverseChain(destChainRaw) : null;
+
+  const pickupFrontier = zoneById.get(pair.from);
+  const destFrontier = zoneById.get(pair.to);
+  const km = Math.round(pair.km * 10) / 10;
+
+  const pickupLabel = pickupFrontier
+    ? `${pickupFrontier.transport_name} · ${pickupFrontier.zone_name}`
+    : `zone #${pair.from}`;
+  const destLabel = destFrontier
+    ? `${destFrontier.transport_name} · ${destFrontier.zone_name}`
+    : `zone #${pair.to}`;
+
+  const message =
+    `No complete route yet. From the pickup the order can reach “${pickupLabel}”, ` +
+    `which is the closest it gets — about ${km} km from “${destLabel}” on the ` +
+    `destination side. Add or extend a transport zone (or pick a transporter ` +
+    `covering both) to bridge this gap.`;
+
+  return {
+    pickup_frontier_zone_id: pair.from,
+    destination_frontier_zone_id: pair.to,
+    distance_km: km,
+    pickup_chain: pickupChain,
+    destination_chain: destChain,
+    suggested_transport_name: destFrontier?.transport_name ?? pickupFrontier?.transport_name ?? null,
+    suggested_zone_name: destFrontier?.zone_name ?? pickupFrontier?.zone_name ?? null,
+    message,
+  };
+}
 
 function describeStatus(
   pickupCount: number,
@@ -718,13 +962,27 @@ export async function previewOrderZoneConnectionsByCoordinates(
   const usedConnectionIds = enumerated.usedConnectionIds;
   const isConnected = chains.length > 0;
 
+  // Milestone 4 — when there is no complete route but both ends have a
+  // covering zone, reconstruct the incomplete routes from each side and the
+  // nearest gap a new/extended zone would need to close.
+  const gap =
+    !isConnected && pickupIds.size > 0 && destIds.size > 0
+      ? await buildGap(pickupIds, destIds, adjacency, zoneById, maxDepth)
+      : null;
+
   // Surface pickup + destination zones plus every zone that appears on a
   // possible route. We deliberately do NOT surface all BFS-reachable zones
-  // anymore — only the ones the sender could actually be routed through.
+  // anymore — only the ones the sender could actually be routed through. When
+  // there's no full route we also surface the incomplete-route zones so the
+  // map can trace how far each side reaches.
   const surfacedIds = new Set<number>();
   pickupIds.forEach((id) => surfacedIds.add(id));
   destIds.forEach((id) => surfacedIds.add(id));
   enumerated.zoneIds.forEach((id) => surfacedIds.add(id));
+  if (gap) {
+    gap.pickup_chain?.zone_ids.forEach((id) => surfacedIds.add(id));
+    gap.destination_chain?.zone_ids.forEach((id) => surfacedIds.add(id));
+  }
   const cellsByZone = await loadCellsForZoneIds(Array.from(surfacedIds));
 
   const summaryById = new Map<number, OrderDraftZoneSummary>();
@@ -813,5 +1071,6 @@ export async function previewOrderZoneConnectionsByCoordinates(
     status,
     message,
     possible_connection_chains: chains,
+    gap,
   };
 }
