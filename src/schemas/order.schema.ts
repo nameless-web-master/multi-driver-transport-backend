@@ -16,10 +16,30 @@ export const createOrderSchema = z.object({
   package_description: z.string().trim().max(1000).optional().default(""),
   weight_kg: z
     .number({ invalid_type_error: "weight_kg must be a number" })
-    .min(0)
+    .positive("Weight must be greater than 0")
     .max(1_000_000)
     .optional()
     .nullable(),
+  package_weight_unit: z.string().trim().max(10).optional().default("kg"),
+  package_length: z
+    .number({ invalid_type_error: "package_length must be a number" })
+    .positive("Length must be greater than 0")
+    .max(1_000_000)
+    .optional()
+    .nullable(),
+  package_width: z
+    .number({ invalid_type_error: "package_width must be a number" })
+    .positive("Width must be greater than 0")
+    .max(1_000_000)
+    .optional()
+    .nullable(),
+  package_height: z
+    .number({ invalid_type_error: "package_height must be a number" })
+    .positive("Height must be greater than 0")
+    .max(1_000_000)
+    .optional()
+    .nullable(),
+  package_dimension_unit: z.string().trim().max(10).optional().default("cm"),
   dimensions: z.string().trim().max(120).optional().default(""),
 });
 

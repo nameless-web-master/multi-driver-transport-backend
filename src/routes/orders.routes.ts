@@ -17,6 +17,11 @@ import {
   DEFAULT_PREVIEW_MAX_DEPTH,
   previewOrderZoneConnectionsByCoordinates,
 } from "../services/orderZoneConnection.service";
+import {
+  RouteCostError,
+  compareOrderRoutes,
+  recalculateRouteCostsForOrder,
+} from "../services/routeCost.service";
 
 export const ordersRouter = Router();
 
@@ -40,6 +45,10 @@ const draftPreviewSchema = z.object({
 
 function handle(res: Response, err: unknown) {
   if (err instanceof OrderError) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  if (err instanceof RouteCostError) {
     res.status(err.status).json({ error: err.message });
     return;
   }
@@ -93,6 +102,40 @@ ordersRouter.get("/", async (req: AuthenticatedRequest, res: Response) => {
   try {
     const orders = await listOrders(ctx(req));
     res.json(orders);
+  } catch (err) {
+    handle(res, err);
+  }
+});
+
+ordersRouter.get("/:id/route-cost-comparison", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  const c = ctx(req);
+  if (c.role !== "sender" && c.role !== "receiver" && c.role !== "admin") {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  try {
+    const comparison = await compareOrderRoutes(id, c);
+    res.json(comparison);
+  } catch (err) {
+    handle(res, err);
+  }
+});
+
+ordersRouter.post("/:id/recalculate-costs", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  const c = ctx(req);
+  if (c.role !== "sender" && c.role !== "receiver" && c.role !== "admin" && c.role !== "driver") {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  try {
+    const comparison = await recalculateRouteCostsForOrder(id, c);
+    res.json(comparison);
   } catch (err) {
     handle(res, err);
   }

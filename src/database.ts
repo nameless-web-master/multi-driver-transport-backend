@@ -160,6 +160,22 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS boundary JSONB;`);
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS rate_cost NUMERIC(12, 2) NOT NULL DEFAULT 0;`);
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'USD';`);
+    // Milestone 5 (revised) — detailed per-zone pricing rules. The transporter
+    // defines these when creating/editing a zone; route cost calculation reads
+    // them directly from the zone. All nullable so a zone with no pricing set
+    // is treated as "missing cost" (manual entry required). `base_fee` is
+    // backfilled from the old flat `rate_cost` so existing zones keep their value.
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS base_fee NUMERIC(12, 2);`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS cost_per_h3_cell NUMERIC(12, 4);`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS cost_per_km NUMERIC(12, 4);`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS cost_per_kg NUMERIC(12, 4);`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS cost_per_volume_unit NUMERIC(12, 6);`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS time_of_day_factor NUMERIC(8, 4);`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS minimum_fee NUMERIC(12, 2);`);
+    await client.query(
+      `UPDATE driver_zones SET base_fee = rate_cost
+       WHERE base_fee IS NULL AND rate_cost IS NOT NULL AND rate_cost > 0;`
+    );
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS available BOOLEAN NOT NULL DEFAULT TRUE;`);
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS trust_payment_forwarder BOOLEAN NOT NULL DEFAULT FALSE;`);
     // Persist the zone creation method explicitly (previously inferred from
@@ -283,6 +299,12 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_description TEXT NOT NULL DEFAULT '';`);
     await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS weight_kg NUMERIC(12, 3);`);
     await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS dimensions TEXT NOT NULL DEFAULT '';`);
+    // Milestone 5 — structured package dimensions for cost calculation.
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_weight_unit TEXT NOT NULL DEFAULT 'kg';`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_length NUMERIC(12, 3);`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_width NUMERIC(12, 3);`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_height NUMERIC(12, 3);`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_dimension_unit TEXT NOT NULL DEFAULT 'cm';`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_pickup_h3 ON orders (pickup_h3);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_delivery_h3 ON orders (delivery_h3);`);
 
@@ -340,6 +362,107 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_zc_transport_b ON zone_connections (transport_b_id);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_zc_is_active ON zone_connections (is_active);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_zc_type ON zone_connections (connection_type);`);
+
+    // ----------------------------------------------------------------------
+    // Milestone 5 — persisted order routes (from M4 chain enumeration) + cost.
+    // ----------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS order_routes (
+        id               SERIAL PRIMARY KEY,
+        order_id         INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        route_label      TEXT    NOT NULL,
+        route_index      INTEGER NOT NULL,
+        zone_ids         JSONB   NOT NULL DEFAULT '[]'::jsonb,
+        connection_ids   JSONB   NOT NULL DEFAULT '[]'::jsonb,
+        transporter_ids  JSONB   NOT NULL DEFAULT '[]'::jsonb,
+        is_complete      BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT order_routes_unique UNIQUE (order_id, route_index)
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_order_routes_order_id ON order_routes (order_id);`);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS transporter_rate_tables (
+        id                    SERIAL PRIMARY KEY,
+        transporter_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        transport_method      TEXT    NOT NULL,
+        currency              TEXT    NOT NULL DEFAULT 'CAD',
+        base_fee              NUMERIC(12, 2) NOT NULL DEFAULT 0,
+        cost_per_h3_cell      NUMERIC(12, 4),
+        cost_per_km           NUMERIC(12, 4),
+        cost_per_kg           NUMERIC(12, 4),
+        cost_per_volume_unit  NUMERIC(12, 6),
+        time_of_day_factor    NUMERIC(8, 4),
+        minimum_fee           NUMERIC(12, 2),
+        is_active             BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT transporter_rate_tables_method_check
+          CHECK (transport_method IN ('land', 'air', 'sea'))
+      );
+    `);
+    await client.query(`ALTER TABLE transporter_rate_tables DROP CONSTRAINT IF EXISTS transporter_rate_tables_currency_check;`);
+    await client.query(
+      `ALTER TABLE transporter_rate_tables
+         ADD CONSTRAINT transporter_rate_tables_currency_check CHECK (currency IN (${currencyList}));`
+    );
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_rate_tables_transporter ON transporter_rate_tables (transporter_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_rate_tables_active ON transporter_rate_tables (is_active);`);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS route_segment_costs (
+        id                    SERIAL PRIMARY KEY,
+        route_id              INTEGER NOT NULL REFERENCES order_routes(id) ON DELETE CASCADE,
+        segment_index         INTEGER NOT NULL DEFAULT 0,
+        transporter_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        from_node_id          TEXT    NOT NULL,
+        to_node_id            TEXT    NOT NULL,
+        transport_method      TEXT    NOT NULL,
+        package_weight        NUMERIC(12, 3),
+        package_volume        NUMERIC(16, 3),
+        distance_h3_cells     INTEGER,
+        distance_km           NUMERIC(12, 3),
+        base_fee              NUMERIC(12, 2),
+        weight_cost           NUMERIC(12, 2),
+        volume_cost           NUMERIC(12, 2),
+        distance_cost         NUMERIC(12, 2),
+        time_factor_amount    NUMERIC(12, 2),
+        calculated_cost       NUMERIC(12, 2),
+        manual_cost           NUMERIC(12, 2),
+        final_cost            NUMERIC(12, 2),
+        cost_status           TEXT    NOT NULL DEFAULT 'missing',
+        currency              TEXT    NOT NULL DEFAULT 'CAD',
+        calculation_breakdown JSONB,
+        created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT route_segment_costs_status_check
+          CHECK (cost_status IN ('calculated', 'manual', 'missing')),
+        CONSTRAINT route_segment_costs_unique UNIQUE (route_id, segment_index)
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_segment_costs_route ON route_segment_costs (route_id);`);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS route_cost_summaries (
+        id                    SERIAL PRIMARY KEY,
+        route_id              INTEGER NOT NULL REFERENCES order_routes(id) ON DELETE CASCADE,
+        order_id              INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        total_calculated_cost NUMERIC(12, 2),
+        total_manual_cost     NUMERIC(12, 2),
+        total_final_cost      NUMERIC(12, 2),
+        missing_segment_count INTEGER NOT NULL DEFAULT 0,
+        currency              TEXT    NOT NULL DEFAULT 'CAD',
+        status                TEXT    NOT NULL DEFAULT 'missing',
+        created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT route_cost_summaries_status_check
+          CHECK (status IN ('complete', 'partial', 'missing')),
+        CONSTRAINT route_cost_summaries_unique UNIQUE (route_id)
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_route_cost_summaries_order ON route_cost_summaries (order_id);`);
 
     console.log("[db] schema ready");
   } finally {

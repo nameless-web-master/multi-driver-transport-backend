@@ -15,6 +15,8 @@ import {
   zoneConnectionsRouter,
   zonesScopedConnectionsRouter,
 } from "./routes/zoneConnections.routes";
+import { rateTablesRouter } from "./routes/rateTables.routes";
+import { routesCostRouter, routeSegmentCostsRouter } from "./routes/routeCost.routes";
 
 dotenv.config();
 
@@ -48,7 +50,7 @@ app.get("/api/health", (_req, res) => {
   res.json({
     status: "ok",
     service: "multi-driver-h3-backend",
-    milestone: 3,
+    milestone: 5,
     auth: true,
     features: [
       "zones",
@@ -57,6 +59,8 @@ app.get("/api/health", (_req, res) => {
       "zone-connections",
       "driver-zone-graph",
       "order-graph",
+      "route-cost",
+      "transporter-rate-tables",
     ],
   });
 });
@@ -75,6 +79,10 @@ app.use("/api/zones", zonesScopedConnectionsRouter);
 app.use("/api/driver-zone-graph", driverZoneGraphRouter);
 // Milestone 3 — Order-based transporter graph (sender → receiver).
 app.use("/api/order-graph", orderGraphRouter);
+// Milestone 5 — Transporter rate tables + route cost calculation.
+app.use("/api/transporter-rate-tables", rateTablesRouter);
+app.use("/api/routes", routesCostRouter);
+app.use("/api/route-segment-costs", routeSegmentCostsRouter);
 
 // 404
 app.use((req, res) => {

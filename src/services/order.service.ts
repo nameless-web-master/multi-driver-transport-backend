@@ -85,6 +85,11 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
     shipping_method: String(row.shipping_method ?? ""),
     package_description: String(row.package_description ?? ""),
     weight_kg: toNullable(row.weight_kg),
+    package_weight_unit: String(row.package_weight_unit ?? "kg"),
+    package_length: toNullable(row.package_length),
+    package_width: toNullable(row.package_width),
+    package_height: toNullable(row.package_height),
+    package_dimension_unit: String(row.package_dimension_unit ?? "cm"),
     dimensions: String(row.dimensions ?? ""),
     status,
     submitted_at: new Date(String(row.submitted_at)),
@@ -119,6 +124,11 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
     shipping_method: order.shipping_method,
     package_description: order.package_description,
     weight_kg: order.weight_kg,
+    package_weight_unit: order.package_weight_unit,
+    package_length: order.package_length,
+    package_width: order.package_width,
+    package_height: order.package_height,
+    package_dimension_unit: order.package_dimension_unit,
     dimensions: order.dimensions,
     status: order.status,
     submitted_at: order.submitted_at.toISOString(),
@@ -171,6 +181,15 @@ export async function createOrder(
   const pickupH3 = coordsToH3(senderLat, senderLng, ORDER_H3_RESOLUTION);
   const deliveryH3 = coordsToH3(destinationLat, destinationLng, ORDER_H3_RESOLUTION);
 
+  const packageLength = data.package_length ?? null;
+  const packageWidth = data.package_width ?? null;
+  const packageHeight = data.package_height ?? null;
+  const dimensionsText =
+    data.dimensions?.trim() ||
+    (packageLength != null && packageWidth != null && packageHeight != null
+      ? `${packageLength} × ${packageWidth} × ${packageHeight} ${data.package_dimension_unit ?? "cm"}`
+      : "");
+
   const insert = await pool.query(
     `INSERT INTO orders
        (sender_user_id, receiver_user_id, driver_user_id,
@@ -179,10 +198,13 @@ export async function createOrder(
         receiver_phone, notes,
         pickup_h3, delivery_h3, h3_resolution,
         source_name, source_contact, payment_method, shipping_method,
-        package_description, weight_kg, dimensions,
+        package_description, weight_kg, package_weight_unit,
+        package_length, package_width, package_height, package_dimension_unit,
+        dimensions,
         status, submitted_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
              $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
+             $22, $23, $24, $25, $26,
              'submitted', NOW())
      RETURNING id`,
     [
@@ -206,7 +228,12 @@ export async function createOrder(
       data.shipping_method ?? "",
       data.package_description ?? "",
       data.weight_kg ?? null,
-      data.dimensions ?? "",
+      data.package_weight_unit ?? "kg",
+      packageLength,
+      packageWidth,
+      packageHeight,
+      data.package_dimension_unit ?? "cm",
+      dimensionsText,
     ]
   );
 

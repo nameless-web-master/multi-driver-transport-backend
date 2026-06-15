@@ -28,12 +28,29 @@ export interface DriverZoneRow {
   arrival_hub: HubTerminal | null;
   departure_time: string | null;
   arrival_time: string | null;
-  rate_cost: number;
+  /** Milestone 5 — per-zone pricing rules (all nullable; null = not set). */
+  base_fee: number | null;
+  cost_per_h3_cell: number | null;
+  cost_per_km: number | null;
+  cost_per_kg: number | null;
+  cost_per_volume_unit: number | null;
+  time_of_day_factor: number | null;
+  minimum_fee: number | null;
   currency: Currency;
   available: boolean;
   trust_payment_forwarder: boolean;
   created_at: Date;
   updated_at: Date;
+}
+
+export interface ZoneRateFields {
+  base_fee?: number | null;
+  cost_per_h3_cell?: number | null;
+  cost_per_km?: number | null;
+  cost_per_kg?: number | null;
+  cost_per_volume_unit?: number | null;
+  time_of_day_factor?: number | null;
+  minimum_fee?: number | null;
 }
 
 export interface DriverZoneCreateInput {
@@ -48,7 +65,13 @@ export interface DriverZoneCreateInput {
   arrival_hub?: HubTerminal | null;
   departure_time?: string | null;
   arrival_time?: string | null;
-  rate_cost: number;
+  base_fee?: number | null;
+  cost_per_h3_cell?: number | null;
+  cost_per_km?: number | null;
+  cost_per_kg?: number | null;
+  cost_per_volume_unit?: number | null;
+  time_of_day_factor?: number | null;
+  minimum_fee?: number | null;
   currency: Currency;
   available: boolean;
   trust_payment_forwarder: boolean;
@@ -65,7 +88,13 @@ export interface DriverZoneUpdateInput {
   arrival_hub?: HubTerminal | null;
   departure_time?: string | null;
   arrival_time?: string | null;
-  rate_cost?: number;
+  base_fee?: number | null;
+  cost_per_h3_cell?: number | null;
+  cost_per_km?: number | null;
+  cost_per_kg?: number | null;
+  cost_per_volume_unit?: number | null;
+  time_of_day_factor?: number | null;
+  minimum_fee?: number | null;
   currency?: Currency;
   available?: boolean;
   trust_payment_forwarder?: boolean;

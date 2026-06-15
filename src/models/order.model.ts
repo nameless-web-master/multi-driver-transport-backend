@@ -27,6 +27,11 @@ export interface OrderRow {
   shipping_method: string;
   package_description: string;
   weight_kg: number | null;
+  package_weight_unit: string;
+  package_length: number | null;
+  package_width: number | null;
+  package_height: number | null;
+  package_dimension_unit: string;
   dimensions: string;
   status: OrderStatus;
   submitted_at: Date;
@@ -61,6 +66,11 @@ export interface OrderResponse {
   shipping_method: string;
   package_description: string;
   weight_kg: number | null;
+  package_weight_unit: string;
+  package_length: number | null;
+  package_width: number | null;
+  package_height: number | null;
+  package_dimension_unit: string;
   dimensions: string;
   status: OrderStatus;
   submitted_at: string;

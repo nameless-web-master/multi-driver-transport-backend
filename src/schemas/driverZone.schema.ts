@@ -36,6 +36,17 @@ const scheduleTimeSchema = z
   .optional()
   .nullable();
 
+/** Optional, non-negative pricing field. Coerces "" / null to undefined. */
+const rateFieldSchema = z.preprocess(
+  (val) => (val === "" || val === null ? undefined : val),
+  z
+    .number({ invalid_type_error: "rate must be a number" })
+    .min(0, "rate must be ≥ 0")
+    .max(1_000_000, "rate is too large")
+    .optional()
+    .nullable()
+);
+
 const zoneBaseFields = {
   driver_name: z.string().trim().min(1, "driver_name is required").max(120),
   zone_name: z.string().trim().min(1, "zone_name is required").max(200),
@@ -46,10 +57,15 @@ const zoneBaseFields = {
   arrival_hub: hubTerminalSchema.optional().nullable(),
   departure_time: scheduleTimeSchema,
   arrival_time: scheduleTimeSchema,
-  rate_cost: z
-    .number({ invalid_type_error: "rate_cost must be a number" })
-    .min(0, "rate_cost must be ≥ 0")
-    .max(1_000_000, "rate_cost is too large"),
+  // Milestone 5 — detailed per-zone pricing. All optional/nullable; a zone
+  // with none of these set is treated as "missing cost" in route costing.
+  base_fee: rateFieldSchema,
+  cost_per_h3_cell: rateFieldSchema,
+  cost_per_km: rateFieldSchema,
+  cost_per_kg: rateFieldSchema,
+  cost_per_volume_unit: rateFieldSchema,
+  time_of_day_factor: rateFieldSchema,
+  minimum_fee: rateFieldSchema,
   currency: currencySchema.optional().default(DEFAULT_CURRENCY),
   available: z.boolean(),
   trust_payment_forwarder: z.boolean(),
@@ -128,7 +144,13 @@ export const updateDriverZoneSchema = z
     arrival_hub: hubTerminalSchema.optional().nullable(),
     departure_time: scheduleTimeSchema,
     arrival_time: scheduleTimeSchema,
-    rate_cost: z.number().min(0).max(1_000_000).optional(),
+    base_fee: rateFieldSchema,
+    cost_per_h3_cell: rateFieldSchema,
+    cost_per_km: rateFieldSchema,
+    cost_per_kg: rateFieldSchema,
+    cost_per_volume_unit: rateFieldSchema,
+    time_of_day_factor: rateFieldSchema,
+    minimum_fee: rateFieldSchema,
     currency: currencySchema.optional(),
     available: z.boolean().optional(),
     trust_payment_forwarder: z.boolean().optional(),
@@ -155,7 +177,13 @@ export interface DriverZoneResponse {
   arrival_hub: HubTerminal | null;
   departure_time: string | null;
   arrival_time: string | null;
-  rate_cost: number;
+  base_fee: number | null;
+  cost_per_h3_cell: number | null;
+  cost_per_km: number | null;
+  cost_per_kg: number | null;
+  cost_per_volume_unit: number | null;
+  time_of_day_factor: number | null;
+  minimum_fee: number | null;
   currency: string;
   available: boolean;
   trust_payment_forwarder: boolean;
