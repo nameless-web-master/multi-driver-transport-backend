@@ -13,11 +13,11 @@ import {
 } from "../schemas/order.schema";
 
 /**
- * Default H3 resolution at which order pickup / delivery coordinates are
- * indexed. Kept in sync with the order-graph + draft-preview services so a
- * stored `pickup_h3` lines up with the cells the graph reasons about.
+ * H3 resolution at which order pickup / delivery coordinates are indexed.
+ * Set to 15 — the finest (smallest) cell H3 supports — so pickup/drop-off
+ * points resolve to the most precise cell possible.
  */
-export const ORDER_H3_RESOLUTION = 8;
+export const ORDER_H3_RESOLUTION = 15;
 
 /** Safely convert a coordinate pair to an H3 index; null on any failure. */
 function coordsToH3(
