@@ -1,6 +1,7 @@
 import {
   cellToChildren,
   cellToLatLng,
+  cellToParent,
   getResolution,
   gridDisk,
   isValidCell,
@@ -227,10 +228,109 @@ function expandToResolution(
 }
 
 /**
+ * Cross-resolution overlap by mapping the FINER zone's cells *up* to the
+ * coarse resolution (one `cellToParent` per fine cell) and keeping those whose
+ * parent is one of the coarse zone's cells.
+ *
+ * This replaces the old "expand the coarse zone *down* to children" approach
+ * for overlap detection. Child expansion multiplies the cell count by ~7 per
+ * resolution level, so a large gap (e.g. a big res-4 zone vs a res-9 zone)
+ * blew past the expansion cap and silently reported "no overlap" — which is
+ * exactly why a zone fully contained inside a much coarser zone (B ⊂ A) got
+ * no connection. Mapping up is O(fine cells) and gap-proof, so containment is
+ * always detected regardless of how far apart the two resolutions are.
+ *
+ * Returns the matching *fine* cells (real cells sitting inside the coarse
+ * zone), which make natural transfer cells for the handoff.
+ */
+function getCrossResOverlapCells(
+  coarseCells: readonly string[],
+  fineCells: readonly string[],
+  coarseRes: number
+): string[] {
+  const coarseSet = new Set(coarseCells);
+  const out: string[] = [];
+  for (const cell of fineCells) {
+    let parent: string;
+    try {
+      parent = cellToParent(cell, coarseRes);
+    } catch {
+      continue;
+    }
+    if (coarseSet.has(parent)) out.push(cell);
+  }
+  return out;
+}
+
+/**
+ * Build an "adjacent" connection result from detected touching cell pairs, or
+ * null when there are none. Extracted so same-resolution and cross-resolution
+ * paths share identical adjacency handling.
+ */
+function buildAdjacencyConnection(
+  pairs: AdjacentCellPair[],
+  mid: Coord | null
+): DetectedConnection | null {
+  if (pairs.length === 0) return null;
+
+  // Representative transfer cells = unique "from" cells (capped) so adjacency
+  // rows have something quick to show in the summary chips without needing the
+  // full adjacent_cell_pairs payload.
+  const reps: string[] = [];
+  const repSeen = new Set<string>();
+  for (const p of pairs) {
+    if (repSeen.has(p.from_cell)) continue;
+    repSeen.add(p.from_cell);
+    reps.push(p.from_cell);
+    if (reps.length >= 16) break;
+  }
+  // Adjacency: pick the touching pair whose midpoint is closest to the overall
+  // midpoint, and recommend that pair's boundary cell (from_cell).
+  let recommended: string | null = reps[0] ?? null;
+  if (mid) {
+    let bestDist = Infinity;
+    for (const p of pairs) {
+      if (!isValidCell(p.from_cell) || !isValidCell(p.to_cell)) continue;
+      let cf: [number, number];
+      let ct: [number, number];
+      try {
+        cf = cellToLatLng(p.from_cell);
+        ct = cellToLatLng(p.to_cell);
+      } catch {
+        continue;
+      }
+      const pmLat = (cf[0] + ct[0]) / 2;
+      const pmLng = (cf[1] + ct[1]) / 2;
+      const dist = (pmLat - mid.lat) ** 2 + (pmLng - mid.lng) ** 2;
+      if (dist < bestDist) {
+        bestDist = dist;
+        recommended = p.from_cell;
+      }
+    }
+  }
+  return {
+    connection_type: "adjacent",
+    transfer_cells: reps,
+    adjacent_cell_pairs: pairs,
+    recommended_transfer_cell: recommended,
+  };
+}
+
+/**
  * Internal: detect overlap/adjacency between two cell sets, accounting for
- * possibly-different resolutions. When the resolutions differ the coarser
- * side is expanded to children at the finer resolution so that two zones
- * covering the same geographic area always intersect on H3 indexes.
+ * possibly-different resolutions.
+ *
+ * Overlap (including full containment) is resolution-agnostic: when the two
+ * sides differ we map the *finer* zone's cells up to the coarse resolution
+ * and keep those whose parent is a coarse cell. This is O(fine cells) and
+ * works no matter how large the resolution gap is — fixing the previous bug
+ * where a zone fully inside a much coarser zone (B ⊂ A) produced no
+ * connection because expanding the coarse zone to children overflowed the cap.
+ *
+ * Adjacency (zones that merely touch, with no shared area) still relies on
+ * a bounded child-expansion when resolutions differ; for very large gaps that
+ * safely yields no adjacency, which is acceptable since huge-gap adjacency is
+ * not meaningful and any containment is already handled by the overlap check.
  *
  * Resolutions are passed in (not derived) so the O(N²) recalc loop doesn't
  * re-derive them per pair.
@@ -243,94 +343,48 @@ function detectBetweenCells(
 ): DetectedConnection | null {
   if (a.length === 0 || b.length === 0) return null;
 
-  let aFine: readonly string[] = a;
-  let bFine: readonly string[] = b;
-
-  if (aRes !== bRes) {
-    const targetRes = Math.max(aRes, bRes);
-    if (aRes < targetRes) {
-      const exp = expandToResolution(a, targetRes);
-      if (exp === null) {
-        console.warn(
-          `[zone-connections] resolution gap too large to expand (aRes=${aRes} -> ${targetRes})`
-        );
-        return null;
-      }
-      aFine = exp;
+  // Same resolution: exact cell-string overlap, then neighbour adjacency.
+  if (aRes === bRes) {
+    const mid = midpoint(centroidOfCells(a), centroidOfCells(b));
+    const overlap = getOverlapCells(a, b);
+    if (overlap.length > 0) {
+      return {
+        connection_type: "overlap",
+        transfer_cells: overlap,
+        adjacent_cell_pairs: [],
+        recommended_transfer_cell: pickClosestCell(overlap, mid),
+      };
     }
-    if (bRes < targetRes) {
-      const exp = expandToResolution(b, targetRes);
-      if (exp === null) {
-        console.warn(
-          `[zone-connections] resolution gap too large to expand (bRes=${bRes} -> ${targetRes})`
-        );
-        return null;
-      }
-      bFine = exp;
-    }
+    return buildAdjacencyConnection(getAdjacentCellPairs(a, b), mid);
   }
 
-  // Midpoint between the two zones' centroids — the target the recommended
-  // transfer cell is chosen to sit closest to.
-  const mid = midpoint(centroidOfCells(aFine), centroidOfCells(bFine));
+  // Different resolutions: detect overlap/containment by mapping the finer
+  // zone up to the coarse resolution (gap-proof), not by expanding the coarse
+  // zone down to children (explodes on large gaps).
+  const coarse = aRes < bRes ? a : b;
+  const fine = aRes < bRes ? b : a;
+  const coarseRes = Math.min(aRes, bRes);
+  const mid = midpoint(centroidOfCells(a), centroidOfCells(b));
 
-  const overlap = getOverlapCells(aFine, bFine);
+  const overlap = getCrossResOverlapCells(coarse, fine, coarseRes);
   if (overlap.length > 0) {
     return {
       connection_type: "overlap",
       transfer_cells: overlap,
       adjacent_cell_pairs: [],
-      // Overlap: pick the shared cell closest to the midpoint.
       recommended_transfer_cell: pickClosestCell(overlap, mid),
     };
   }
 
-  const pairs = getAdjacentCellPairs(aFine, bFine);
-  if (pairs.length > 0) {
-    // Representative transfer cells = unique "from" cells (capped) so
-    // adjacency rows have something quick to show in the summary chips
-    // without needing the full adjacent_cell_pairs payload.
-    const reps: string[] = [];
-    const repSeen = new Set<string>();
-    for (const p of pairs) {
-      if (repSeen.has(p.from_cell)) continue;
-      repSeen.add(p.from_cell);
-      reps.push(p.from_cell);
-      if (reps.length >= 16) break;
-    }
-    // Adjacency: pick the touching pair whose midpoint is closest to the
-    // overall midpoint, and recommend that pair's boundary cell (from_cell).
-    let recommended: string | null = reps[0] ?? null;
-    if (mid) {
-      let bestDist = Infinity;
-      for (const p of pairs) {
-        if (!isValidCell(p.from_cell) || !isValidCell(p.to_cell)) continue;
-        let cf: [number, number];
-        let ct: [number, number];
-        try {
-          cf = cellToLatLng(p.from_cell);
-          ct = cellToLatLng(p.to_cell);
-        } catch {
-          continue;
-        }
-        const pmLat = (cf[0] + ct[0]) / 2;
-        const pmLng = (cf[1] + ct[1]) / 2;
-        const dist = (pmLat - mid.lat) ** 2 + (pmLng - mid.lng) ** 2;
-        if (dist < bestDist) {
-          bestDist = dist;
-          recommended = p.from_cell;
-        }
-      }
-    }
-    return {
-      connection_type: "adjacent",
-      transfer_cells: reps,
-      adjacent_cell_pairs: pairs,
-      recommended_transfer_cell: recommended,
-    };
-  }
+  // No shared area — fall back to a bounded expansion to catch genuine
+  // adjacency between modestly different resolutions. Large gaps return null
+  // (no adjacency), which is fine: containment is already handled above.
+  const targetRes = Math.max(aRes, bRes);
+  const aFine = aRes < targetRes ? expandToResolution(a, targetRes) : a;
+  const bFine = bRes < targetRes ? expandToResolution(b, targetRes) : b;
+  if (aFine === null || bFine === null) return null;
 
-  return null;
+  return buildAdjacencyConnection(getAdjacentCellPairs(aFine, bFine), mid);
 }
 
 /**
