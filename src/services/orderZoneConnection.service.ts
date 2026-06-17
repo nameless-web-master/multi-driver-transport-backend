@@ -23,7 +23,7 @@ import type {
 export const ORDER_H3_RESOLUTION = 8;
 
 /** Default BFS depth limit when walking the zone-connection graph. */
-export const DEFAULT_PREVIEW_MAX_DEPTH = 6;
+export const DEFAULT_PREVIEW_MAX_DEPTH = 15;
 
 /**
  * Great-circle distance between two lat/lng points, in kilometres.

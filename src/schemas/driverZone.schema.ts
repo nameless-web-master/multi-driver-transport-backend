@@ -163,6 +163,12 @@ export type CreateDriverZoneRequest = z.infer<typeof createDriverZoneSchema>;
 export type UpdateDriverZoneRequest = z.infer<typeof updateDriverZoneSchema>;
 export type HubTerminal = z.infer<typeof hubTerminalSchema>;
 
+export const setOwnerZonesAvailabilitySchema = z.object({
+  available: z.boolean(),
+});
+
+export type SetOwnerZonesAvailabilityRequest = z.infer<typeof setOwnerZonesAvailabilitySchema>;
+
 export interface DriverZoneResponse {
   id: number;
   owner_user_id: number;

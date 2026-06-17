@@ -760,3 +760,47 @@ export async function deleteDriverZone(id: number, ctx: ZoneAccessContext): Prom
   );
   return (result.rowCount ?? 0) > 0;
 }
+
+export class ZoneAvailabilityError extends Error {
+  status: number;
+  constructor(message: string, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/** Admin-only: set `available` on every zone owned by a transporter. */
+export async function setOwnerZonesAvailability(
+  ownerUserId: number,
+  available: boolean,
+  ctx: ZoneAccessContext
+): Promise<{ updated_count: number }> {
+  if (ctx.role !== "admin") {
+    throw new ZoneAvailabilityError(
+      "Only admins can bulk-update transporter zone availability",
+      403
+    );
+  }
+
+  const userCheck = await pool.query(`SELECT id, role FROM users WHERE id = $1`, [ownerUserId]);
+  if ((userCheck.rowCount ?? 0) === 0) {
+    throw new ZoneAvailabilityError("Transporter not found", 404);
+  }
+  if (userCheck.rows[0].role !== "driver") {
+    throw new ZoneAvailabilityError("User is not a transporter", 400);
+  }
+
+  const result = await pool.query(
+    `UPDATE driver_zones SET available = $2, updated_at = NOW() WHERE owner_user_id = $1 RETURNING id`,
+    [ownerUserId, available]
+  );
+  const zoneIds = result.rows.map((row) => Number(row.id));
+
+  for (const zoneId of zoneIds) {
+    recalculateConnectionsForZone(zoneId).catch((err) =>
+      console.error("[zone-connections] recalc after bulk availability failed:", err)
+    );
+  }
+
+  return { updated_count: zoneIds.length };
+}
