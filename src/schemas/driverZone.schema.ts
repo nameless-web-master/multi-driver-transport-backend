@@ -57,11 +57,12 @@ const zoneBaseFields = {
   arrival_hub: hubTerminalSchema.optional().nullable(),
   departure_time: scheduleTimeSchema,
   arrival_time: scheduleTimeSchema,
-  // Milestone 5 — detailed per-zone pricing. All optional/nullable; a zone
-  // with none of these set is treated as "missing cost" in route costing.
+  // Pricing engine — base cost, travel rate (per km), wage (per hour).
   base_fee: rateFieldSchema,
-  cost_per_h3_cell: rateFieldSchema,
   cost_per_km: rateFieldSchema,
+  cost_per_hour: rateFieldSchema,
+  // Legacy fields kept for backward compatibility; not used by the pricing engine.
+  cost_per_h3_cell: rateFieldSchema,
   cost_per_kg: rateFieldSchema,
   cost_per_volume_unit: rateFieldSchema,
   time_of_day_factor: rateFieldSchema,
@@ -145,8 +146,9 @@ export const updateDriverZoneSchema = z
     departure_time: scheduleTimeSchema,
     arrival_time: scheduleTimeSchema,
     base_fee: rateFieldSchema,
-    cost_per_h3_cell: rateFieldSchema,
     cost_per_km: rateFieldSchema,
+    cost_per_hour: rateFieldSchema,
+    cost_per_h3_cell: rateFieldSchema,
     cost_per_kg: rateFieldSchema,
     cost_per_volume_unit: rateFieldSchema,
     time_of_day_factor: rateFieldSchema,
@@ -184,8 +186,9 @@ export interface DriverZoneResponse {
   departure_time: string | null;
   arrival_time: string | null;
   base_fee: number | null;
-  cost_per_h3_cell: number | null;
   cost_per_km: number | null;
+  cost_per_hour: number | null;
+  cost_per_h3_cell: number | null;
   cost_per_kg: number | null;
   cost_per_volume_unit: number | null;
   time_of_day_factor: number | null;

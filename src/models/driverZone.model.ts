@@ -30,8 +30,9 @@ export interface DriverZoneRow {
   arrival_time: string | null;
   /** Milestone 5 — per-zone pricing rules (all nullable; null = not set). */
   base_fee: number | null;
-  cost_per_h3_cell: number | null;
   cost_per_km: number | null;
+  cost_per_hour: number | null;
+  cost_per_h3_cell: number | null;
   cost_per_kg: number | null;
   cost_per_volume_unit: number | null;
   time_of_day_factor: number | null;
@@ -45,8 +46,9 @@ export interface DriverZoneRow {
 
 export interface ZoneRateFields {
   base_fee?: number | null;
-  cost_per_h3_cell?: number | null;
   cost_per_km?: number | null;
+  cost_per_hour?: number | null;
+  cost_per_h3_cell?: number | null;
   cost_per_kg?: number | null;
   cost_per_volume_unit?: number | null;
   time_of_day_factor?: number | null;
@@ -66,8 +68,9 @@ export interface DriverZoneCreateInput {
   departure_time?: string | null;
   arrival_time?: string | null;
   base_fee?: number | null;
-  cost_per_h3_cell?: number | null;
   cost_per_km?: number | null;
+  cost_per_hour?: number | null;
+  cost_per_h3_cell?: number | null;
   cost_per_kg?: number | null;
   cost_per_volume_unit?: number | null;
   time_of_day_factor?: number | null;
@@ -89,8 +92,9 @@ export interface DriverZoneUpdateInput {
   departure_time?: string | null;
   arrival_time?: string | null;
   base_fee?: number | null;
-  cost_per_h3_cell?: number | null;
   cost_per_km?: number | null;
+  cost_per_hour?: number | null;
+  cost_per_h3_cell?: number | null;
   cost_per_kg?: number | null;
   cost_per_volume_unit?: number | null;
   time_of_day_factor?: number | null;

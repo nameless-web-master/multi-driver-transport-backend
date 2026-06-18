@@ -1,3 +1,5 @@
+import type { PackageType } from "./package.model";
+
 export const ORDER_STATUSES = ["submitted", "delivering", "received"] as const;
 export type OrderStatus = (typeof ORDER_STATUSES)[number];
 
@@ -26,7 +28,9 @@ export interface OrderRow {
   payment_method: string;
   shipping_method: string;
   package_description: string;
-  weight_kg: number | null;
+  package_type: PackageType | null;
+  package_factor: number | null;
+  weight_lbs: number | null;
   package_weight_unit: string;
   package_length: number | null;
   package_width: number | null;
@@ -65,7 +69,9 @@ export interface OrderResponse {
   payment_method: string;
   shipping_method: string;
   package_description: string;
-  weight_kg: number | null;
+  package_type: PackageType | null;
+  package_factor: number | null;
+  weight_lbs: number | null;
   package_weight_unit: string;
   package_length: number | null;
   package_width: number | null;

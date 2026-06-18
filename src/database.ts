@@ -172,6 +172,7 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS cost_per_volume_unit NUMERIC(12, 6);`);
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS time_of_day_factor NUMERIC(8, 4);`);
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS minimum_fee NUMERIC(12, 2);`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS cost_per_hour NUMERIC(12, 4);`);
     await client.query(
       `UPDATE driver_zones SET base_fee = rate_cost
        WHERE base_fee IS NULL AND rate_cost IS NOT NULL AND rate_cost > 0;`
@@ -305,6 +306,35 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_width NUMERIC(12, 3);`);
     await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_height NUMERIC(12, 3);`);
     await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_dimension_unit TEXT NOT NULL DEFAULT 'cm';`);
+    // Pricing engine — package classification + enforced unit defaults.
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_type TEXT;`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_factor NUMERIC(10, 6);`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS weight_lbs NUMERIC(12, 3);`);
+    // Backfill canonical lbs column from legacy weight_kg (values were already migrated to lb).
+    await client.query(
+      `UPDATE orders
+         SET weight_lbs = CASE
+           WHEN package_weight_unit = 'kg' AND weight_kg IS NOT NULL
+             THEN ROUND(weight_kg * 2.20462, 3)
+           ELSE weight_kg
+         END
+       WHERE weight_lbs IS NULL AND weight_kg IS NOT NULL;`
+    );
+    await client.query(
+      `UPDATE orders SET weight_kg = weight_lbs WHERE weight_lbs IS NOT NULL AND (weight_kg IS NULL OR weight_kg <> weight_lbs);`
+    );
+    await client.query(
+      `UPDATE orders SET package_type = 'medium', package_factor = 0.05
+       WHERE package_type IS NULL;`
+    );
+    await client.query(
+      `UPDATE orders SET package_weight_unit = 'lb' WHERE package_weight_unit IS NULL OR package_weight_unit = 'kg';`
+    );
+    await client.query(
+      `UPDATE orders SET package_dimension_unit = 'in' WHERE package_dimension_unit IS NULL OR package_dimension_unit IN ('cm', 'm');`
+    );
+    await client.query(`ALTER TABLE orders ALTER COLUMN package_weight_unit SET DEFAULT 'lb';`);
+    await client.query(`ALTER TABLE orders ALTER COLUMN package_dimension_unit SET DEFAULT 'in';`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_pickup_h3 ON orders (pickup_h3);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_delivery_h3 ON orders (delivery_h3);`);
 
@@ -438,11 +468,20 @@ export async function ensureSchema(): Promise<void> {
         created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CONSTRAINT route_segment_costs_status_check
-          CHECK (cost_status IN ('calculated', 'manual', 'missing')),
+          CHECK (cost_status IN ('calculated', 'manual', 'missing', 'requested')),
         CONSTRAINT route_segment_costs_unique UNIQUE (route_id, segment_index)
       );
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_segment_costs_route ON route_segment_costs (route_id);`);
+    await client.query(`ALTER TABLE route_segment_costs ADD COLUMN IF NOT EXISTS waiting_cost NUMERIC(12, 2);`);
+    await client.query(`ALTER TABLE route_segment_costs ADD COLUMN IF NOT EXISTS booking_fee NUMERIC(12, 2);`);
+    await client.query(`ALTER TABLE route_segment_costs ADD COLUMN IF NOT EXISTS package_factor NUMERIC(10, 6);`);
+    await client.query(`ALTER TABLE route_segment_costs ADD COLUMN IF NOT EXISTS time_hours NUMERIC(10, 4);`);
+    await client.query(`ALTER TABLE route_segment_costs DROP CONSTRAINT IF EXISTS route_segment_costs_status_check;`);
+    await client.query(
+      `ALTER TABLE route_segment_costs ADD CONSTRAINT route_segment_costs_status_check
+         CHECK (cost_status IN ('calculated', 'manual', 'missing', 'requested'));`
+    );
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS route_cost_summaries (
@@ -463,6 +502,28 @@ export async function ensureSchema(): Promise<void> {
       );
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_route_cost_summaries_order ON route_cost_summaries (order_id);`);
+
+    // Pricing engine — system-wide settings (booking fee, etc.).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS system_settings (
+        key         TEXT PRIMARY KEY,
+        value       TEXT NOT NULL,
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+    await client.query(
+      `INSERT INTO system_settings (key, value)
+       VALUES ('booking_fee_rate', '0.02')
+       ON CONFLICT (key) DO NOTHING;`
+    );
+    await client.query(
+      `INSERT INTO system_settings (key, value)
+       VALUES ('land_speed_kmh', '50')
+       ON CONFLICT (key) DO NOTHING;`
+    );
+
+    await client.query(`ALTER TABLE route_segment_costs ADD COLUMN IF NOT EXISTS cost_source TEXT;`);
+    await client.query(`ALTER TABLE route_cost_summaries ADD COLUMN IF NOT EXISTS requested_segment_count INTEGER NOT NULL DEFAULT 0;`);
 
     console.log("[db] schema ready");
   } finally {

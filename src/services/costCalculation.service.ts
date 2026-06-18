@@ -1,9 +1,12 @@
 import { gridDistance, latLngToCell } from "h3-js";
 import type {
   SegmentCostBreakdown,
+  SegmentCostSource,
   SegmentCostStatus,
 } from "../models/routeCost.model";
 import type { OrderResponse } from "../models/order.model";
+import { packageFactorForType, type PackageType } from "../models/package.model";
+import { DEFAULT_BOOKING_FEE_RATE, DEFAULT_LAND_SPEED_KMH } from "../models/pricing.model";
 import { ORDER_H3_RESOLUTION } from "./order.service";
 
 export interface DerivedSegment {
@@ -14,39 +17,13 @@ export interface DerivedSegment {
   transport_method: string;
   from_zone_id: number | null;
   to_zone_id: number | null;
-  /** The zone(s) priced by this segment. One zone per segment. */
   zone_ids: number[];
-}
-
-export function calculatePackageVolume(
-  length: number | null,
-  width: number | null,
-  height: number | null
-): number | null {
-  if (
-    length == null ||
-    width == null ||
-    height == null ||
-    !Number.isFinite(length) ||
-    !Number.isFinite(width) ||
-    !Number.isFinite(height) ||
-    length <= 0 ||
-    width <= 0 ||
-    height <= 0
-  ) {
-    return null;
-  }
-  return length * width * height;
 }
 
 function roundMoney(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-/**
- * Great-circle distance in km between two lat/lng points. Used for air/sea
- * "line" routes, which are priced per km between departure and arrival hubs.
- */
 export function haversineKm(
   lat1: number | null,
   lng1: number | null,
@@ -79,9 +56,6 @@ function isLineMode(method: string): boolean {
   return method === "air" || method === "sea";
 }
 
-/**
- * H3 grid distance between two zone centroids (approximate segment length).
- */
 export function calculateSegmentDistanceH3(
   fromLat: number | null,
   fromLng: number | null,
@@ -105,7 +79,6 @@ export function calculateSegmentDistanceH3(
     const fromCell = latLngToCell(fromLat, fromLng, resolution);
     const toCell = latLngToCell(toLat, toLng, resolution);
     const cells = gridDistance(fromCell, toCell);
-    // Rough km estimate: res-8 hex edge ~0.46 km
     const kmPerCell = resolution <= 4 ? 22 : resolution <= 6 ? 3.2 : resolution <= 8 ? 0.46 : 0.17;
     return {
       distance_h3_cells: cells,
@@ -116,30 +89,20 @@ export function calculateSegmentDistanceH3(
   }
 }
 
-/**
- * Pricing rules for a segment, sourced from the entry zone of the segment
- * (the transporter defines these on the zone). A `null` rate means the zone
- * has no pricing configured → the segment is reported as "missing cost".
- */
+/** Pricing rules sourced from the segment's zone. */
 export interface SegmentRate {
   currency: string;
   base_fee: number | null;
-  cost_per_h3_cell: number | null;
   cost_per_km: number | null;
-  cost_per_kg: number | null;
-  cost_per_volume_unit: number | null;
-  time_of_day_factor: number | null;
-  minimum_fee: number | null;
+  cost_per_hour: number | null;
 }
 
 export interface SegmentCostInput {
   segment: DerivedSegment;
   order: Pick<
     OrderResponse,
-    | "weight_kg"
-    | "package_length"
-    | "package_width"
-    | "package_height"
+    | "package_type"
+    | "package_factor"
     | "sender_lat"
     | "sender_lng"
     | "destination_lat"
@@ -147,39 +110,169 @@ export interface SegmentCostInput {
   >;
   rate: SegmentRate | null;
   zoneCoords: Map<number, { lat: number; lng: number; transport_method: string | null }>;
-  /**
-   * For air/sea (line) segments: the great-circle distance in km between the
-   * entry zone's departure and arrival hubs. Used to price the leg per km.
-   */
   lineDistanceKm?: number | null;
-  /**
-   * Path-accurate distance for this leg, computed by the route cost service
-   * from the actual zone path:
-   *  - `distance_h3_cells` = number of H3 cells the package travels through
-   *    (land), i.e. entry→exit per zone summed — NOT the zone's total cells.
-   *  - `distance_km` = routed great-circle distance (air/sea), or a derived km
-   *    for land display.
-   * When present it takes precedence over the centroid estimate.
-   */
-  distanceOverride?: { distance_h3_cells: number | null; distance_km: number | null };
+  /** Zone schedule times used for waiting-cost (hours). */
+  departureTime?: string | null;
+  arrivalTime?: string | null;
+  distanceOverride?: {
+    distance_h3_cells: number | null;
+    distance_km: number | null;
+    /** Road routing duration (e.g. Google Directions) when zone schedule is absent. */
+    duration_hours?: number | null;
+  };
+  packageFactor?: number;
+  bookingFeeRate?: number;
+  landSpeedKmh?: number;
 }
 
 export interface SegmentCostResult {
-  package_weight: number | null;
-  package_volume: number | null;
+  package_factor: number | null;
   distance_h3_cells: number | null;
   distance_km: number | null;
+  time_hours: number | null;
   base_fee: number | null;
-  weight_cost: number | null;
-  volume_cost: number | null;
   distance_cost: number | null;
-  time_factor_amount: number | null;
+  waiting_cost: number | null;
+  booking_fee: number | null;
+  weight_cost: null;
+  volume_cost: null;
+  time_factor_amount: null;
   calculated_cost: number | null;
   manual_cost: number | null;
   final_cost: number | null;
   cost_status: SegmentCostStatus;
+  cost_source: SegmentCostSource | null;
   currency: string;
   calculation_breakdown: SegmentCostBreakdown | null;
+}
+
+/** AIR segments never auto-calculate; SEA/LAND may when rates are configured. */
+export function transportAllowsAutoCost(transportMethod: string): boolean {
+  return transportMethod !== "air";
+}
+
+export function transportRequiresCostRequest(transportMethod: string): boolean {
+  return transportMethod === "air";
+}
+
+export function calculatePackageFactor(
+  packageType: PackageType | null | undefined,
+  explicitFactor: number | null | undefined
+): number {
+  if (explicitFactor != null && Number.isFinite(explicitFactor) && explicitFactor > 0) {
+    return explicitFactor;
+  }
+  if (packageType) {
+    return packageFactorForType(packageType);
+  }
+  return packageFactorForType("medium");
+}
+
+export function calculateBaseCost(rate: SegmentRate | null): number {
+  return Number(rate?.base_fee ?? 0);
+}
+
+export function calculateTravelCost(distanceKm: number | null, ratePerKm: number | null): number {
+  if (distanceKm == null || ratePerKm == null) return 0;
+  return distanceKm * ratePerKm;
+}
+
+/**
+ * Waiting cost = time (hours) × wage (cost per hour).
+ * Time is derived from zone departure/arrival schedule (HH:MM).
+ */
+export function scheduleDurationHours(
+  departureTime: string | null | undefined,
+  arrivalTime: string | null | undefined
+): number | null {
+  if (!departureTime || !arrivalTime) return null;
+  const depMatch = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(departureTime.trim());
+  const arrMatch = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(arrivalTime.trim());
+  if (!depMatch || !arrMatch) return null;
+  const depMinutes = Number(depMatch[1]) * 60 + Number(depMatch[2]);
+  let arrMinutes = Number(arrMatch[1]) * 60 + Number(arrMatch[2]);
+  if (arrMinutes < depMinutes) arrMinutes += 24 * 60;
+  return roundMoney((arrMinutes - depMinutes) / 60);
+}
+
+export function estimateLandTransitHours(
+  distanceKm: number | null,
+  landSpeedKmh = DEFAULT_LAND_SPEED_KMH
+): number | null {
+  if (distanceKm == null || distanceKm <= 0 || landSpeedKmh <= 0) return null;
+  return roundMoney(distanceKm / landSpeedKmh);
+}
+
+/**
+ * Waiting/transit hours: zone schedule first; for land, estimate from distance when absent.
+ */
+export function resolveSegmentTimeHours(
+  transportMethod: string,
+  departureTime: string | null | undefined,
+  arrivalTime: string | null | undefined,
+  distanceKm: number | null,
+  landSpeedKmh = DEFAULT_LAND_SPEED_KMH,
+  roadDurationHours?: number | null
+): number | null {
+  const scheduled = scheduleDurationHours(departureTime, arrivalTime);
+  if (scheduled != null) return scheduled;
+  if (roadDurationHours != null && Number.isFinite(roadDurationHours)) {
+    return roundMoney(roadDurationHours);
+  }
+  if (transportMethod === "land") {
+    return estimateLandTransitHours(distanceKm, landSpeedKmh);
+  }
+  return null;
+}
+
+export function calculateWaitingCost(timeHours: number | null, wagePerHour: number | null): number {
+  if (timeHours == null || wagePerHour == null) return 0;
+  return timeHours * wagePerHour;
+}
+
+export function calculateBookingFee(subTotal: number, rate = DEFAULT_BOOKING_FEE_RATE): number {
+  return subTotal * rate;
+}
+
+export function calculateTotalCost(
+  adjustedBase: number,
+  travellingCost: number,
+  waitingCost: number,
+  bookingFeeRate = DEFAULT_BOOKING_FEE_RATE
+): { subTotal: number; bookingFee: number; total: number } {
+  const subTotal = adjustedBase + travellingCost + waitingCost;
+  const bookingFee = calculateBookingFee(subTotal, bookingFeeRate);
+  return {
+    subTotal: roundMoney(subTotal),
+    bookingFee: roundMoney(bookingFee),
+    total: roundMoney(subTotal + bookingFee),
+  };
+}
+
+function resolveDistanceKm(
+  segment: DerivedSegment,
+  order: SegmentCostInput["order"],
+  zoneCoords: SegmentCostInput["zoneCoords"],
+  lineDistanceKm: number | null | undefined,
+  distanceOverride: SegmentCostInput["distanceOverride"]
+): { distanceKm: number | null; distanceCells: number | null } {
+  let distanceKm = distanceOverride?.distance_km ?? null;
+  const distanceCells = distanceOverride?.distance_h3_cells ?? null;
+
+  if (distanceKm == null) {
+    const line = isLineMode(segment.transport_method);
+    if (line) {
+      distanceKm = lineDistanceKm ?? null;
+    }
+    if (distanceKm == null) {
+      const from = resolveCoords(segment.from_node_id, order, zoneCoords);
+      const to = resolveCoords(segment.to_node_id, order, zoneCoords);
+      const dist = calculateSegmentDistanceH3(from.lat, from.lng, to.lat, to.lng);
+      distanceKm = dist.distance_km;
+    }
+  }
+
+  return { distanceKm, distanceCells };
 }
 
 function resolveCoords(
@@ -201,144 +294,118 @@ function resolveCoords(
   return { lat: null, lng: null };
 }
 
+function rateIsConfigured(rate: SegmentRate | null): boolean {
+  if (!rate) return false;
+  return (
+    rate.base_fee != null || rate.cost_per_km != null || rate.cost_per_hour != null
+  );
+}
+
+function emptyResult(
+  status: SegmentCostStatus,
+  currency: string,
+  packageFactor: number | null
+): SegmentCostResult {
+  return {
+    package_factor: packageFactor,
+    distance_h3_cells: null,
+    distance_km: null,
+    time_hours: null,
+    base_fee: null,
+    distance_cost: null,
+    waiting_cost: null,
+    booking_fee: null,
+    weight_cost: null,
+    volume_cost: null,
+    time_factor_amount: null,
+    calculated_cost: null,
+    manual_cost: null,
+    final_cost: null,
+    cost_status: status,
+    cost_source: null,
+    currency,
+    calculation_breakdown: null,
+  };
+}
+
 export function calculateSegmentCost(input: SegmentCostInput): SegmentCostResult {
   const { segment, order, rate, zoneCoords } = input;
   const currency = rate?.currency ?? "CAD";
-  const packageWeight = order.weight_kg;
-  const packageVolume = calculatePackageVolume(
-    order.package_length,
-    order.package_width,
-    order.package_height
+  const packageFactor = calculatePackageFactor(order.package_type, input.packageFactor ?? order.package_factor);
+  const bookingFeeRate = input.bookingFeeRate ?? DEFAULT_BOOKING_FEE_RATE;
+  const method = segment.transport_method;
+
+  if (transportRequiresCostRequest(method)) {
+    return emptyResult("requested", currency, packageFactor);
+  }
+
+  if (!rateIsConfigured(rate)) {
+    return emptyResult(method === "sea" ? "requested" : "missing", currency, packageFactor);
+  }
+
+  const baseCost = calculateBaseCost(rate);
+  const adjustedBase = roundMoney(baseCost * packageFactor);
+
+  const { distanceKm, distanceCells } = resolveDistanceKm(
+    segment,
+    order,
+    zoneCoords,
+    input.lineDistanceKm,
+    input.distanceOverride
   );
 
-  if (!rate) {
-    return {
-      package_weight: packageWeight,
-      package_volume: packageVolume,
-      distance_h3_cells: null,
-      distance_km: null,
-      base_fee: null,
-      weight_cost: null,
-      volume_cost: null,
-      distance_cost: null,
-      time_factor_amount: null,
-      calculated_cost: null,
-      manual_cost: null,
-      final_cost: null,
-      cost_status: "missing",
-      currency,
-      calculation_breakdown: null,
-    };
-  }
+  const timeHours = resolveSegmentTimeHours(
+    method,
+    input.departureTime,
+    input.arrivalTime,
+    distanceKm,
+    input.landSpeedKmh ?? DEFAULT_LAND_SPEED_KMH,
+    input.distanceOverride?.duration_hours
+  );
+  const travellingCost = roundMoney(calculateTravelCost(distanceKm, rate?.cost_per_km ?? null));
+  const waitingCost = roundMoney(calculateWaitingCost(timeHours, rate?.cost_per_hour ?? null));
 
-  const baseFee = Number(rate.base_fee ?? 0);
+  const { subTotal, bookingFee, total } = calculateTotalCost(
+    adjustedBase,
+    travellingCost,
+    waitingCost,
+    bookingFeeRate
+  );
 
-  // Distance model depends on transport type:
-  //  - Land zones are made of H3 cells → measured by the number of cells the
-  //    package actually travels through along the route (entry→exit per zone),
-  //    priced per cell. NOT the zone's total cell count.
-  //  - Air/sea zones are a line between two terminals → measured by the routed
-  //    great-circle distance, priced per km.
-  // `distanceOverride` carries the path-accurate distance from the route cost
-  // service; we only fall back to a centroid estimate when it is absent.
-  const line = isLineMode(segment.transport_method);
-  let distanceCells = input.distanceOverride?.distance_h3_cells ?? null;
-  let distanceKm = input.distanceOverride?.distance_km ?? null;
-
-  if (distanceCells == null && distanceKm == null) {
-    if (line) {
-      distanceKm = input.lineDistanceKm ?? null;
-    }
-    if (distanceCells == null && distanceKm == null) {
-      const from = resolveCoords(segment.from_node_id, order, zoneCoords);
-      const to = resolveCoords(segment.to_node_id, order, zoneCoords);
-      const dist = calculateSegmentDistanceH3(from.lat, from.lng, to.lat, to.lng);
-      if (line) {
-        distanceKm = dist.distance_km;
-      } else {
-        distanceCells = dist.distance_h3_cells;
-        distanceKm = dist.distance_km;
-      }
-    }
-  }
-
-  let distanceCost = 0;
-  if (line) {
-    if (rate.cost_per_km != null && distanceKm != null) {
-      distanceCost = distanceKm * rate.cost_per_km;
-    }
-  } else if (rate.cost_per_h3_cell != null && distanceCells != null) {
-    distanceCost = distanceCells * rate.cost_per_h3_cell;
-  } else if (rate.cost_per_km != null && distanceKm != null) {
-    distanceCost = distanceKm * rate.cost_per_km;
-  }
-
-  const weightCost =
-    rate.cost_per_kg != null && packageWeight != null
-      ? packageWeight * rate.cost_per_kg
-      : 0;
-
-  const volumeCost =
-    rate.cost_per_volume_unit != null && packageVolume != null
-      ? packageVolume * rate.cost_per_volume_unit
-      : 0;
-
-  let subtotal = baseFee + distanceCost + weightCost + volumeCost;
-  let timeFactorAmount = 0;
-  if (rate.time_of_day_factor != null && rate.time_of_day_factor > 0) {
-    const factored = subtotal * rate.time_of_day_factor;
-    timeFactorAmount = factored - subtotal;
-    subtotal = factored;
-  }
-
-  let minimumApplied = false;
-  if (rate.minimum_fee != null && subtotal < rate.minimum_fee) {
-    subtotal = rate.minimum_fee;
-    minimumApplied = true;
-  }
-
-  const calculated = roundMoney(subtotal);
   const breakdown: SegmentCostBreakdown = {
-    base_fee: roundMoney(baseFee),
-    distance_cost: roundMoney(distanceCost),
-    weight_cost: roundMoney(weightCost),
-    volume_cost: roundMoney(volumeCost),
-    time_factor_amount: roundMoney(timeFactorAmount),
-    subtotal_before_minimum: roundMoney(baseFee + distanceCost + weightCost + volumeCost),
-    minimum_fee_applied: minimumApplied,
+    base_cost: roundMoney(baseCost),
+    package_factor: packageFactor,
+    adjusted_base_cost: adjustedBase,
+    travelling_cost: travellingCost,
+    waiting_cost: waitingCost,
+    sub_total: subTotal,
+    booking_fee_rate: bookingFeeRate,
+    booking_fee: bookingFee,
+    total_cost: total,
   };
 
   return {
-    package_weight: packageWeight,
-    package_volume: packageVolume,
+    package_factor: packageFactor,
     distance_h3_cells: distanceCells,
     distance_km: distanceKm,
-    base_fee: breakdown.base_fee,
-    weight_cost: breakdown.weight_cost,
-    volume_cost: breakdown.volume_cost,
-    distance_cost: breakdown.distance_cost,
-    time_factor_amount: breakdown.time_factor_amount ?? 0,
-    calculated_cost: calculated,
+    time_hours: timeHours,
+    base_fee: breakdown.base_cost,
+    distance_cost: travellingCost,
+    waiting_cost: waitingCost,
+    booking_fee: bookingFee,
+    weight_cost: null,
+    volume_cost: null,
+    time_factor_amount: null,
+    calculated_cost: total,
     manual_cost: null,
-    final_cost: calculated,
+    final_cost: total,
     cost_status: "calculated",
+    cost_source: "calculated",
     currency,
     calculation_breakdown: breakdown,
   };
 }
 
-/**
- * One zone = one segment.
- *
- * Each zone carries its OWN transporter, transport mode, rate and distance.
- * A single transporter may own several zones along a route — and those zones
- * can even be different modes (e.g. land → sea → land). Collapsing them into
- * one transporter "leg" would force a single mode and a single zone's rate
- * onto the whole leg, which mis-labels and mis-prices it (a cross-continent
- * sea hop priced as a handful of land cells). Keeping one segment per zone
- * lets every leg be measured and priced with its own zone's settings, and it
- * matches the per-row breakdown UI where each row has a single method/rate.
- */
 export function deriveSegmentsFromRoute(
   zoneIds: number[],
   zoneMeta: Map<number, { owner_user_id: number; transport_mode: string | null }>
@@ -352,9 +419,6 @@ export function deriveSegmentsFromRoute(
     if (!meta) continue;
     const method = meta.transport_mode ?? "land";
 
-    // `from`/`to` are display boundaries that chain the path together
-    // (Sender → Zone A → Zone B → Receiver). The rate is always taken from
-    // THIS zone via `from_zone_id`/`to_zone_id`.
     const isFirst = segments.length === 0;
     const fromNode = isFirst ? "sender" : String(zoneIds[i - 1]);
     const toNode = i === zoneIds.length - 1 ? "receiver" : String(zoneId);

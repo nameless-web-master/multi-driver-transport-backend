@@ -1,4 +1,5 @@
-export type SegmentCostStatus = "calculated" | "manual" | "missing";
+export type SegmentCostStatus = "calculated" | "manual" | "missing" | "requested";
+export type SegmentCostSource = "calculated" | "manual" | "external";
 export type RouteCostStatus = "complete" | "partial" | "missing";
 
 export interface OrderRouteRow {
@@ -15,13 +16,15 @@ export interface OrderRouteRow {
 }
 
 export interface SegmentCostBreakdown {
-  base_fee: number;
-  distance_cost: number;
-  weight_cost: number;
-  volume_cost: number;
-  time_factor_amount?: number;
-  subtotal_before_minimum?: number;
-  minimum_fee_applied?: boolean;
+  base_cost: number;
+  package_factor: number;
+  adjusted_base_cost: number;
+  travelling_cost: number;
+  waiting_cost: number;
+  sub_total: number;
+  booking_fee_rate: number;
+  booking_fee: number;
+  total_cost: number;
 }
 
 export interface RouteSegmentCostRow {
@@ -36,15 +39,20 @@ export interface RouteSegmentCostRow {
   package_volume: number | null;
   distance_h3_cells: number | null;
   distance_km: number | null;
+  time_hours: number | null;
+  package_factor: number | null;
   base_fee: number | null;
   weight_cost: number | null;
   volume_cost: number | null;
   distance_cost: number | null;
+  waiting_cost: number | null;
+  booking_fee: number | null;
   time_factor_amount: number | null;
   calculated_cost: number | null;
   manual_cost: number | null;
   final_cost: number | null;
   cost_status: SegmentCostStatus;
+  cost_source: SegmentCostSource | null;
   currency: string;
   calculation_breakdown: SegmentCostBreakdown | null;
   created_at: Date;
@@ -59,6 +67,7 @@ export interface RouteCostSummaryRow {
   total_manual_cost: number | null;
   total_final_cost: number | null;
   missing_segment_count: number;
+  requested_segment_count: number;
   currency: string;
   status: RouteCostStatus;
   created_at: Date;
@@ -77,8 +86,12 @@ export interface RouteSegmentCostResponse {
   transport_method: string;
   distance_h3_cells: number | null;
   distance_km: number | null;
+  time_hours: number | null;
+  package_factor: number | null;
   base_fee: number | null;
   distance_cost: number | null;
+  waiting_cost: number | null;
+  booking_fee: number | null;
   weight_cost: number | null;
   volume_cost: number | null;
   time_factor_amount: number | null;
@@ -86,6 +99,7 @@ export interface RouteSegmentCostResponse {
   manual_cost: number | null;
   final_cost: number | null;
   cost_status: SegmentCostStatus;
+  cost_source: SegmentCostSource | null;
   currency: string;
   breakdown: SegmentCostBreakdown | null;
 }
@@ -100,6 +114,7 @@ export interface RouteCostSummaryResponse {
   total_manual_cost: number | null;
   total_final_cost: number | null;
   missing_segment_count: number;
+  requested_segment_count: number;
   currency: string;
   status: RouteCostStatus;
   segments: RouteSegmentCostResponse[];
@@ -108,5 +123,35 @@ export interface RouteCostSummaryResponse {
 export interface OrderRouteCostComparisonResponse {
   order_id: number;
   currency: string;
+  booking_fee_rate: number;
+  package_type: string | null;
+  package_factor: number | null;
+  package_weight_lbs: number | null;
+  package_dimensions_in: string | null;
   routes: RouteCostSummaryResponse[];
+}
+
+/** Pending segment cost work for a transporter (quote requested or missing rates). */
+export interface TransporterQuoteRequestItem {
+  order_id: number;
+  order_status: string;
+  sender_address: string;
+  destination_address: string;
+  package_type: string | null;
+  package_weight_lbs: number | null;
+  package_dimensions_in: string | null;
+  route_id: number;
+  route_label: string;
+  segment: RouteSegmentCostResponse;
+  updated_at: string;
+}
+
+/** Segment still needs a price entered (missing rates or air quote pending). */
+export function segmentNeedsCostEntry(status: SegmentCostStatus): boolean {
+  return status === "missing" || status === "requested";
+}
+
+/** Only `missing` should trigger automatic recalculation (not stable `requested`). */
+export function segmentNeedsRecalculation(status: SegmentCostStatus): boolean {
+  return status === "missing";
 }

@@ -9,13 +9,14 @@ import { driverZonesRouter } from "./routes/driverZones.routes";
 import { driverZoneGraphRouter } from "./routes/driverZoneGraph.routes";
 import { ordersRouter } from "./routes/orders.routes";
 import { orderGraphRouter } from "./routes/orderGraph.routes";
-import { backfillOrderH3 } from "./services/order.service";
+import { backfillOrderH3, backfillOrderPricing } from "./services/order.service";
 import { usersRouter } from "./routes/users.routes";
 import {
   zoneConnectionsRouter,
   zonesScopedConnectionsRouter,
 } from "./routes/zoneConnections.routes";
 import { rateTablesRouter } from "./routes/rateTables.routes";
+import { pricingRouter } from "./routes/pricing.routes";
 import { routesCostRouter, routeSegmentCostsRouter } from "./routes/routeCost.routes";
 
 dotenv.config();
@@ -60,7 +61,8 @@ app.get("/api/health", (_req, res) => {
       "driver-zone-graph",
       "order-graph",
       "route-cost",
-      "transporter-rate-tables",
+      "pricing-config",
+      "transporter-rate-tables-deprecated",
     ],
   });
 });
@@ -79,8 +81,9 @@ app.use("/api/zones", zonesScopedConnectionsRouter);
 app.use("/api/driver-zone-graph", driverZoneGraphRouter);
 // Milestone 3 — Order-based transporter graph (sender → receiver).
 app.use("/api/order-graph", orderGraphRouter);
-// Milestone 5 — Transporter rate tables + route cost calculation.
+// Milestone 5 — Transporter rate tables (deprecated) + route cost + pricing config.
 app.use("/api/transporter-rate-tables", rateTablesRouter);
+app.use("/api/pricing", pricingRouter);
 app.use("/api/routes", routesCostRouter);
 app.use("/api/route-segment-costs", routeSegmentCostsRouter);
 
@@ -115,6 +118,12 @@ async function bootstrap() {
     if (filled > 0) console.log(`[db] backfilled H3 for ${filled} order(s)`);
   } catch (err) {
     console.error("[db] order H3 backfill failed:", err);
+  }
+  try {
+    const priced = await backfillOrderPricing();
+    if (priced > 0) console.log(`[db] backfilled package pricing for ${priced} order(s)`);
+  } catch (err) {
+    console.error("[db] order pricing backfill failed:", err);
   }
   app.listen(PORT, () => {
     console.log(`API ready on http://localhost:${PORT}`);

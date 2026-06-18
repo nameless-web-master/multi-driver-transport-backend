@@ -4,6 +4,7 @@ import { AuthenticatedRequest, requireAuth } from "../dependencies/auth.middlewa
 import { latitudeSchema, longitudeSchema } from "../schemas/h3.schema";
 import {
   createOrderSchema,
+  updateOrderPackageSchema,
   updateOrderStatusSchema,
 } from "../schemas/order.schema";
 import {
@@ -11,6 +12,7 @@ import {
   createOrder,
   getOrderById,
   listOrders,
+  updateOrderPackage,
   updateOrderStatus,
 } from "../services/order.service";
 import {
@@ -113,7 +115,12 @@ ordersRouter.get("/:id/route-cost-comparison", async (req: AuthenticatedRequest,
     return res.status(400).json({ error: "Invalid order id" });
   }
   const c = ctx(req);
-  if (c.role !== "sender" && c.role !== "receiver" && c.role !== "admin") {
+  if (
+    c.role !== "sender" &&
+    c.role !== "receiver" &&
+    c.role !== "admin" &&
+    c.role !== "driver"
+  ) {
     return res.status(403).json({ error: "Forbidden" });
   }
   try {
@@ -166,6 +173,35 @@ ordersRouter.post("/", async (req: AuthenticatedRequest, res: Response) => {
   try {
     const order = await createOrder(ctx(req), parsed.data);
     res.status(201).json(order);
+  } catch (err) {
+    handle(res, err);
+  }
+});
+
+ordersRouter.patch("/:id/package", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  const parsed = updateOrderPackageSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Validation failed",
+      details: parsed.error.flatten().fieldErrors,
+    });
+  }
+  try {
+    const order = await updateOrderPackage(id, ctx(req), parsed.data);
+    let route_cost_recalculated = false;
+    try {
+      await recalculateRouteCostsForOrder(id, ctx(req));
+      route_cost_recalculated = true;
+    } catch (recalcErr) {
+      if (!(recalcErr instanceof RouteCostError && recalcErr.status === 404)) {
+        console.warn("[orders] package updated but route cost recalc failed:", recalcErr);
+      }
+    }
+    res.json({ order, route_cost_recalculated });
   } catch (err) {
     handle(res, err);
   }

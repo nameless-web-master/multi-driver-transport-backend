@@ -9,8 +9,11 @@ import {
 import type { UserRole } from "../models/userRole.model";
 import {
   CreateOrderRequest,
+  UpdateOrderPackageRequest,
   UpdateOrderStatusRequest,
 } from "../schemas/order.schema";
+import { packageFactorForType, isPackageType } from "../models/package.model";
+import type { PackageType } from "../models/package.model";
 
 /**
  * H3 resolution at which order pickup / delivery coordinates are indexed.
@@ -84,12 +87,18 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
     payment_method: String(row.payment_method ?? ""),
     shipping_method: String(row.shipping_method ?? ""),
     package_description: String(row.package_description ?? ""),
-    weight_kg: toNullable(row.weight_kg),
-    package_weight_unit: String(row.package_weight_unit ?? "kg"),
+    package_type: isPackageType(row.package_type) ? row.package_type : null,
+    package_factor: toNullable(row.package_factor),
+    weight_lbs:
+      toNullable(row.weight_lbs) ??
+      (String(row.package_weight_unit ?? "lb") === "kg" && row.weight_kg != null
+        ? Math.round(Number(row.weight_kg) * 2.20462 * 1000) / 1000
+        : toNullable(row.weight_kg)),
+    package_weight_unit: String(row.package_weight_unit ?? "lb"),
     package_length: toNullable(row.package_length),
     package_width: toNullable(row.package_width),
     package_height: toNullable(row.package_height),
-    package_dimension_unit: String(row.package_dimension_unit ?? "cm"),
+    package_dimension_unit: String(row.package_dimension_unit ?? "in"),
     dimensions: String(row.dimensions ?? ""),
     status,
     submitted_at: new Date(String(row.submitted_at)),
@@ -123,7 +132,9 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
     payment_method: order.payment_method,
     shipping_method: order.shipping_method,
     package_description: order.package_description,
-    weight_kg: order.weight_kg,
+    package_type: order.package_type,
+    package_factor: order.package_factor,
+    weight_lbs: order.weight_lbs,
     package_weight_unit: order.package_weight_unit,
     package_length: order.package_length,
     package_width: order.package_width,
@@ -184,10 +195,13 @@ export async function createOrder(
   const packageLength = data.package_length ?? null;
   const packageWidth = data.package_width ?? null;
   const packageHeight = data.package_height ?? null;
+  const packageType: PackageType = data.package_type;
+  const packageFactor = packageFactorForType(packageType);
+  const weightLbs = data.weight_lbs ?? null;
   const dimensionsText =
     data.dimensions?.trim() ||
     (packageLength != null && packageWidth != null && packageHeight != null
-      ? `${packageLength} × ${packageWidth} × ${packageHeight} ${data.package_dimension_unit ?? "cm"}`
+      ? `${packageLength} × ${packageWidth} × ${packageHeight} in`
       : "");
 
   const insert = await pool.query(
@@ -198,13 +212,14 @@ export async function createOrder(
         receiver_phone, notes,
         pickup_h3, delivery_h3, h3_resolution,
         source_name, source_contact, payment_method, shipping_method,
-        package_description, weight_kg, package_weight_unit,
+        package_description, package_type, package_factor,
+        weight_kg, weight_lbs, package_weight_unit,
         package_length, package_width, package_height, package_dimension_unit,
         dimensions,
         status, submitted_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
              $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
-             $22, $23, $24, $25, $26,
+             $22, $23, $24, $25, $26, $27, $28, $29,
              'submitted', NOW())
      RETURNING id`,
     [
@@ -227,12 +242,15 @@ export async function createOrder(
       data.payment_method ?? "",
       data.shipping_method ?? "",
       data.package_description ?? "",
-      data.weight_kg ?? null,
-      data.package_weight_unit ?? "kg",
+      packageType,
+      packageFactor,
+      weightLbs,
+      weightLbs,
+      "lb",
       packageLength,
       packageWidth,
       packageHeight,
-      data.package_dimension_unit ?? "cm",
+      "in",
       dimensionsText,
     ]
   );
@@ -253,7 +271,15 @@ export async function listOrders(ctx: OrderContext): Promise<OrderResponse[]> {
     where = `WHERE o.receiver_user_id = $1`;
   } else if (ctx.role === "driver") {
     params.push(ctx.userId);
-    where = `WHERE o.driver_user_id = $1`;
+    where = `WHERE (
+      o.driver_user_id = $1
+      OR EXISTS (
+        SELECT 1
+        FROM route_segment_costs sc
+        JOIN order_routes r ON r.id = sc.route_id
+        WHERE r.order_id = o.id AND sc.transporter_id = $1
+      )
+    )`;
   }
 
   const result = await pool.query(
@@ -274,7 +300,15 @@ export async function getOrderById(id: number, ctx: OrderContext): Promise<Order
     extra = ` AND o.receiver_user_id = $${params.length}`;
   } else if (ctx.role === "driver") {
     params.push(ctx.userId);
-    extra = ` AND o.driver_user_id = $${params.length}`;
+    extra = ` AND (
+      o.driver_user_id = $${params.length}
+      OR EXISTS (
+        SELECT 1
+        FROM route_segment_costs sc
+        JOIN order_routes r ON r.id = sc.route_id
+        WHERE r.order_id = o.id AND sc.transporter_id = $${params.length}
+      )
+    )`;
   }
   const result = await pool.query(
     `${ORDER_SELECT} WHERE o.id = $1${extra}`,
@@ -321,6 +355,72 @@ export async function updateOrderStatus(
   return refreshed;
 }
 
+export async function updateOrderPackage(
+  id: number,
+  ctx: OrderContext,
+  data: UpdateOrderPackageRequest
+): Promise<OrderResponse> {
+  if (ctx.role !== "sender" && ctx.role !== "admin") {
+    throw new OrderError("Only senders and admins can update package details", 403);
+  }
+
+  const existing = await getOrderById(id, ctx);
+  if (!existing) throw new OrderError("Order not found", 404);
+  if (existing.status !== "submitted") {
+    throw new OrderError("Package details can only be edited while the order is submitted", 400);
+  }
+
+  const packageType = data.package_type ?? existing.package_type ?? "medium";
+  const packageFactor = packageFactorForType(packageType);
+  const weightLbs = data.weight_lbs !== undefined ? data.weight_lbs : existing.weight_lbs;
+  const packageLength =
+    data.package_length !== undefined ? data.package_length : existing.package_length;
+  const packageWidth = data.package_width !== undefined ? data.package_width : existing.package_width;
+  const packageHeight =
+    data.package_height !== undefined ? data.package_height : existing.package_height;
+  const packageDescription =
+    data.package_description !== undefined
+      ? data.package_description
+      : existing.package_description;
+  const dimensionsText =
+    data.dimensions?.trim() ||
+    (packageLength != null && packageWidth != null && packageHeight != null
+      ? `${packageLength} × ${packageWidth} × ${packageHeight} in`
+      : existing.dimensions);
+
+  await pool.query(
+    `UPDATE orders
+     SET package_type = $2,
+         package_factor = $3,
+         weight_lbs = $4,
+         weight_kg = $4,
+         package_weight_unit = 'lb',
+         package_length = $5,
+         package_width = $6,
+         package_height = $7,
+         package_dimension_unit = 'in',
+         package_description = $8,
+         dimensions = $9,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [
+      id,
+      packageType,
+      packageFactor,
+      weightLbs,
+      packageLength,
+      packageWidth,
+      packageHeight,
+      packageDescription,
+      dimensionsText,
+    ]
+  );
+
+  const refreshed = await getOrderById(id, ctx);
+  if (!refreshed) throw new OrderError("Failed to load order", 500);
+  return refreshed;
+}
+
 /**
  * One-shot backfill: populate `pickup_h3` / `delivery_h3` (and the
  * resolution) for orders created before these columns existed, deriving
@@ -358,4 +458,40 @@ export async function backfillOrderH3(): Promise<number> {
     updated++;
   }
   return updated;
+}
+
+/**
+ * Backfill package_type, weight_lbs, and unit defaults for legacy orders.
+ */
+export async function backfillOrderPricing(): Promise<number> {
+  const result = await pool.query(
+    `UPDATE orders
+     SET package_type = COALESCE(package_type, 'medium'),
+         package_factor = COALESCE(package_factor, 0.05),
+         weight_lbs = COALESCE(
+           weight_lbs,
+           CASE
+             WHEN package_weight_unit = 'kg' AND weight_kg IS NOT NULL
+               THEN ROUND(weight_kg * 2.20462, 3)
+             ELSE weight_kg
+           END
+         ),
+         weight_kg = COALESCE(
+           weight_lbs,
+           CASE
+             WHEN package_weight_unit = 'kg' AND weight_kg IS NOT NULL
+               THEN ROUND(weight_kg * 2.20462, 3)
+             ELSE weight_kg
+           END
+         ),
+         package_weight_unit = 'lb',
+         package_dimension_unit = 'in'
+     WHERE package_type IS NULL
+        OR package_factor IS NULL
+        OR weight_lbs IS NULL
+        OR package_weight_unit IS DISTINCT FROM 'lb'
+        OR package_dimension_unit IS DISTINCT FROM 'in'
+     RETURNING id`
+  );
+  return result.rowCount ?? 0;
 }

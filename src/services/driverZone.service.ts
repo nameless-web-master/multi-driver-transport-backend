@@ -27,7 +27,7 @@ const ZONE_SELECT = `
          z.departure_hub_name, z.departure_hub_lat, z.departure_hub_lng,
          z.arrival_hub_name, z.arrival_hub_lat, z.arrival_hub_lng,
          z.departure_time, z.arrival_time,
-         z.base_fee, z.cost_per_h3_cell, z.cost_per_km, z.cost_per_kg,
+         z.base_fee, z.cost_per_h3_cell, z.cost_per_km, z.cost_per_hour, z.cost_per_kg,
          z.cost_per_volume_unit, z.time_of_day_factor, z.minimum_fee,
          z.currency, z.available, z.trust_payment_forwarder,
          z.created_at, z.updated_at,
@@ -82,6 +82,7 @@ function rowToResponse(row: DriverZoneRow & { driver_trustworthiness?: number })
     base_fee: row.base_fee,
     cost_per_h3_cell: row.cost_per_h3_cell,
     cost_per_km: row.cost_per_km,
+    cost_per_hour: row.cost_per_hour,
     cost_per_kg: row.cost_per_kg,
     cost_per_volume_unit: row.cost_per_volume_unit,
     time_of_day_factor: row.time_of_day_factor,
@@ -151,6 +152,7 @@ function parseRow(row: Record<string, unknown>): DriverZoneRow & { driver_trustw
     base_fee: toNullableNum(row.base_fee),
     cost_per_h3_cell: toNullableNum(row.cost_per_h3_cell),
     cost_per_km: toNullableNum(row.cost_per_km),
+    cost_per_hour: toNullableNum(row.cost_per_hour),
     cost_per_kg: toNullableNum(row.cost_per_kg),
     cost_per_volume_unit: toNullableNum(row.cost_per_volume_unit),
     time_of_day_factor: toNullableNum(row.time_of_day_factor),
@@ -410,13 +412,13 @@ export async function createDriverZone(
         departure_hub_name, departure_hub_lat, departure_hub_lng,
         arrival_hub_name, arrival_hub_lat, arrival_hub_lng,
         departure_time, arrival_time,
-        base_fee, cost_per_h3_cell, cost_per_km, cost_per_kg,
+        base_fee, cost_per_h3_cell, cost_per_km, cost_per_hour, cost_per_kg,
         cost_per_volume_unit, time_of_day_factor, minimum_fee,
         currency, available, trust_payment_forwarder)
      VALUES ($1, $2, $3, $4, $5::jsonb, ARRAY[$6]::TEXT[], $6, $7::jsonb,
              $8, $9, $10, $11, $12, $13, $14, $15,
-             $16, $17, $18, $19, $20, $21, $22,
-             $23, $24, $25)
+             $16, $17, $18, $19, $20, $21, $22, $23,
+             $24, $25, $26)
      RETURNING id`,
     [
       input.owner_user_id,
@@ -437,6 +439,7 @@ export async function createDriverZone(
       input.base_fee ?? null,
       input.cost_per_h3_cell ?? null,
       input.cost_per_km ?? null,
+      input.cost_per_hour ?? null,
       input.cost_per_kg ?? null,
       input.cost_per_volume_unit ?? null,
       input.time_of_day_factor ?? null,
@@ -487,6 +490,7 @@ export async function createDriverZoneFromRequest(
     base_fee: data.base_fee ?? null,
     cost_per_h3_cell: data.cost_per_h3_cell ?? null,
     cost_per_km: data.cost_per_km ?? null,
+    cost_per_hour: data.cost_per_hour ?? null,
     cost_per_kg: data.cost_per_kg ?? null,
     cost_per_volume_unit: data.cost_per_volume_unit ?? null,
     time_of_day_factor: data.time_of_day_factor ?? null,
@@ -513,6 +517,8 @@ export async function updateDriverZone(
   const cost_per_h3_cell =
     input.cost_per_h3_cell !== undefined ? input.cost_per_h3_cell : existing.cost_per_h3_cell;
   const cost_per_km = input.cost_per_km !== undefined ? input.cost_per_km : existing.cost_per_km;
+  const cost_per_hour =
+    input.cost_per_hour !== undefined ? input.cost_per_hour : existing.cost_per_hour;
   const cost_per_kg = input.cost_per_kg !== undefined ? input.cost_per_kg : existing.cost_per_kg;
   const cost_per_volume_unit =
     input.cost_per_volume_unit !== undefined
@@ -611,6 +617,7 @@ export async function updateDriverZone(
     base_fee,
     cost_per_h3_cell,
     cost_per_km,
+    cost_per_hour,
     cost_per_kg,
     cost_per_volume_unit,
     time_of_day_factor,
@@ -650,9 +657,9 @@ export async function updateDriverZone(
            arrival_hub_name = $9, arrival_hub_lat = $10, arrival_hub_lng = $11,
            departure_time = $12, arrival_time = $13,
            base_fee = $14, cost_per_h3_cell = $15, cost_per_km = $16,
-           cost_per_kg = $17, cost_per_volume_unit = $18,
-           time_of_day_factor = $19, minimum_fee = $20,
-           currency = $21, available = $22, trust_payment_forwarder = $23,
+           cost_per_hour = $17, cost_per_kg = $18, cost_per_volume_unit = $19,
+           time_of_day_factor = $20, minimum_fee = $21,
+           currency = $22, available = $23, trust_payment_forwarder = $24,
            updated_at = NOW()${cellsSql}
      WHERE id = $${idParamIdx}${ownerClause}
      RETURNING id`,
@@ -692,6 +699,7 @@ export async function updateDriverZone(
       base_fee,
       cost_per_h3_cell,
       cost_per_km,
+      cost_per_hour,
       cost_per_kg,
       cost_per_volume_unit,
       time_of_day_factor,
@@ -726,6 +734,7 @@ export async function updateDriverZoneFromRequest(
     base_fee: data.base_fee,
     cost_per_h3_cell: data.cost_per_h3_cell,
     cost_per_km: data.cost_per_km,
+    cost_per_hour: data.cost_per_hour,
     cost_per_kg: data.cost_per_kg,
     cost_per_volume_unit: data.cost_per_volume_unit,
     time_of_day_factor: data.time_of_day_factor,

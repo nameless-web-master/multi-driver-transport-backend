@@ -8,7 +8,8 @@
     "build": "tsc",
     "start": "node dist/main.js",
     "migrate": "tsx src/scripts/migrate.ts",
-    "seed:m5": "tsx src/scripts/seedMilestone5Demo.ts"
+    "seed:m5": "tsx src/scripts/seedMilestone5Demo.ts",
+    "test": "tsx --test src/**/*.test.ts"
   },
   "keywords": [
     "h3",

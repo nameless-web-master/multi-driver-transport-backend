@@ -1,0 +1,81 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { segmentNeedsCostEntry, segmentNeedsRecalculation } from "../models/routeCost.model";
+import {
+  calculatePackageFactor,
+  calculateTotalCost,
+  calculateTravelCost,
+  calculateWaitingCost,
+  estimateLandTransitHours,
+  resolveSegmentTimeHours,
+  scheduleDurationHours,
+  transportRequiresCostRequest,
+} from "./costCalculation.service";
+
+describe("calculatePackageFactor", () => {
+  it("maps package types to client factors", () => {
+    assert.equal(calculatePackageFactor("letter", null), 0.01);
+    assert.equal(calculatePackageFactor("large", null), 0.2);
+    assert.equal(calculatePackageFactor(null, null), 0.05);
+  });
+
+  it("prefers explicit factor when set", () => {
+    assert.equal(calculatePackageFactor("small", 0.15), 0.15);
+  });
+});
+
+describe("scheduleDurationHours", () => {
+  it("computes hours between HH:MM times", () => {
+    assert.equal(scheduleDurationHours("09:00", "11:30"), 2.5);
+  });
+
+  it("handles overnight wrap", () => {
+    assert.equal(scheduleDurationHours("22:00", "02:00"), 4);
+  });
+});
+
+describe("resolveSegmentTimeHours", () => {
+  it("falls back to land distance estimate when no schedule", () => {
+    const hours = resolveSegmentTimeHours("land", null, null, 100);
+    assert.equal(hours, 2);
+  });
+});
+
+describe("estimateLandTransitHours", () => {
+  it("uses default land speed", () => {
+    assert.equal(estimateLandTransitHours(50), 1);
+  });
+  it("accepts configurable land speed", () => {
+    assert.equal(estimateLandTransitHours(100, 25), 4);
+  });
+});
+
+describe("cost components", () => {
+  it("calculates travel and waiting", () => {
+    assert.equal(calculateTravelCost(10, 2), 20);
+    assert.equal(calculateWaitingCost(3, 25), 75);
+  });
+
+  it("applies booking fee to sub-total", () => {
+    const { subTotal, bookingFee, total } = calculateTotalCost(10, 20, 5, 0.02);
+    assert.equal(subTotal, 35);
+    assert.equal(bookingFee, 0.7);
+    assert.equal(total, 35.7);
+  });
+});
+
+describe("segment status helpers", () => {
+  it("treats requested as needing entry but not recalculation", () => {
+    assert.equal(segmentNeedsCostEntry("requested"), true);
+    assert.equal(segmentNeedsRecalculation("requested"), false);
+    assert.equal(segmentNeedsRecalculation("missing"), true);
+  });
+});
+
+describe("transport rules", () => {
+  it("requires cost request for air only", () => {
+    assert.equal(transportRequiresCostRequest("air"), true);
+    assert.equal(transportRequiresCostRequest("sea"), false);
+    assert.equal(transportRequiresCostRequest("land"), false);
+  });
+});

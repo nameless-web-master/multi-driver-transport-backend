@@ -6,8 +6,12 @@ import type {
   RouteCostStatus,
   RouteCostSummaryResponse,
   RouteSegmentCostResponse,
+  SegmentCostSource,
   SegmentCostStatus,
+  TransporterQuoteRequestItem,
 } from "../models/routeCost.model";
+import { segmentNeedsCostEntry, segmentNeedsRecalculation } from "../models/routeCost.model";
+import { getBookingFeeRate, getLandSpeedKmh } from "./pricingConfig.service";
 import { getOrderById, type OrderContext } from "./order.service";
 import {
   DEFAULT_PREVIEW_MAX_DEPTH,
@@ -21,6 +25,13 @@ import {
   type DerivedSegment,
   type SegmentRate,
 } from "./costCalculation.service";
+import { resolveLandLegRoute } from "./roadRouting.service";
+import {
+  ExternalQuoteError,
+  fetchExternalQuote,
+  isExternalQuoteConfigured,
+  type ExternalQuoteRequest,
+} from "./externalQuote.service";
 
 export class RouteCostError extends Error {
   status: number;
@@ -150,17 +161,33 @@ async function loadZoneMetaForIds(
 ): Promise<
   Map<
     number,
-    { owner_user_id: number; transport_mode: string | null; zone_name: string; resolution: number | null }
+    {
+      owner_user_id: number;
+      transport_mode: string | null;
+      zone_name: string;
+      resolution: number | null;
+      departure_time: string | null;
+      arrival_time: string | null;
+    }
   >
 > {
   if (zoneIds.length === 0) return new Map();
   const result = await pool.query(
-    `SELECT id, owner_user_id, transport_mode, zone_name, resolution FROM driver_zones WHERE id = ANY($1::int[])`,
+    `SELECT id, owner_user_id, transport_mode, zone_name, resolution,
+            departure_time, arrival_time
+     FROM driver_zones WHERE id = ANY($1::int[])`,
     [zoneIds]
   );
   const map = new Map<
     number,
-    { owner_user_id: number; transport_mode: string | null; zone_name: string; resolution: number | null }
+    {
+      owner_user_id: number;
+      transport_mode: string | null;
+      zone_name: string;
+      resolution: number | null;
+      departure_time: string | null;
+      arrival_time: string | null;
+    }
   >();
   for (const row of result.rows) {
     map.set(Number(row.id), {
@@ -171,6 +198,8 @@ async function loadZoneMetaForIds(
         row.resolution == null || !Number.isFinite(Number(row.resolution))
           ? null
           : Number(row.resolution),
+      departure_time: row.departure_time == null ? null : String(row.departure_time),
+      arrival_time: row.arrival_time == null ? null : String(row.arrival_time),
     });
   }
   return map;
@@ -216,8 +245,7 @@ async function loadZoneCentroids(
 async function loadZoneRates(zoneIds: number[]): Promise<Map<number, SegmentRate>> {
   if (zoneIds.length === 0) return new Map();
   const result = await pool.query(
-    `SELECT id, currency, base_fee, cost_per_h3_cell, cost_per_km, cost_per_kg,
-            cost_per_volume_unit, time_of_day_factor, minimum_fee
+    `SELECT id, currency, base_fee, cost_per_km, cost_per_hour
      FROM driver_zones WHERE id = ANY($1::int[])`,
     [zoneIds]
   );
@@ -228,20 +256,11 @@ async function loadZoneRates(zoneIds: number[]): Promise<Map<number, SegmentRate
     const rate: SegmentRate = {
       currency: String(row.currency ?? "CAD"),
       base_fee: num(row.base_fee),
-      cost_per_h3_cell: num(row.cost_per_h3_cell),
       cost_per_km: num(row.cost_per_km),
-      cost_per_kg: num(row.cost_per_kg),
-      cost_per_volume_unit: num(row.cost_per_volume_unit),
-      time_of_day_factor: num(row.time_of_day_factor),
-      minimum_fee: num(row.minimum_fee),
+      cost_per_hour: num(row.cost_per_hour),
     };
     const configured =
-      rate.base_fee != null ||
-      rate.cost_per_h3_cell != null ||
-      rate.cost_per_km != null ||
-      rate.cost_per_kg != null ||
-      rate.cost_per_volume_unit != null ||
-      rate.minimum_fee != null;
+      rate.base_fee != null || rate.cost_per_km != null || rate.cost_per_hour != null;
     if (configured) map.set(Number(row.id), rate);
   }
   return map;
@@ -336,16 +355,11 @@ async function loadConnectionsByIds(
 }
 
 /**
- * Compute the path-accurate distance for each segment:
- *  - Land zones: the number of H3 cells the package travels through, measured
- *    from where it enters the zone (sender or the transfer cell from the
- *    previous zone) to where it exits (the transfer cell to the next zone, or
- *    receiver). Summed across the leg's zones. This is "only the cells crossed",
- *    not the zone's full cell count.
- *  - Air/sea zones: the routed great-circle distance between the zone's
- *    departure and arrival hubs, summed across the leg's zones.
+ * Compute distance for each segment:
+ *  - Land zones: Google Directions road km when configured, else H3; sums per zone leg.
+ *  - Air/sea zones: great-circle hub distance.
  */
-function computeSegmentDistances(
+async function computeSegmentDistances(
   zoneIds: number[],
   connectionIds: number[],
   order: OrderResponse,
@@ -354,7 +368,12 @@ function computeSegmentDistances(
   zoneLineKm: Map<number, number>,
   connectionsById: Map<number, { zone_a_id: number; zone_b_id: number; transfer_cells: string[] }>,
   segments: DerivedSegment[]
-): Map<number, { distance_h3_cells: number | null; distance_km: number | null }> {
+): Promise<
+  Map<
+    number,
+    { distance_h3_cells: number | null; distance_km: number | null; duration_hours: number | null }
+  >
+> {
   const transferAt = (i: number): LatLng | null => {
     const connId = connectionIds[i];
     if (connId != null) {
@@ -378,41 +397,59 @@ function computeSegmentDistances(
       ? { lat: order.destination_lat, lng: order.destination_lng }
       : null;
 
-  const perZone = new Map<number, { cells: number | null; km: number | null }>();
+  const perZone = new Map<number, { cells: number | null; km: number | null; hours: number | null }>();
   for (let i = 0; i < zoneIds.length; i++) {
     const zoneId = zoneIds[i];
     const meta = zoneMeta.get(zoneId);
     const mode = meta?.transport_mode ?? "land";
     if (mode === "air" || mode === "sea") {
-      perZone.set(zoneId, { cells: null, km: zoneLineKm.get(zoneId) ?? null });
+      perZone.set(zoneId, { cells: null, km: zoneLineKm.get(zoneId) ?? null, hours: null });
       continue;
     }
     const centroid = zoneCoords.get(zoneId) ?? null;
     const entry = (i === 0 ? sender : transferAt(i - 1)) ?? centroid;
     const exit = (i === zoneIds.length - 1 ? receiver : transferAt(i)) ?? centroid;
     if (!entry || !exit) {
-      perZone.set(zoneId, { cells: null, km: null });
+      perZone.set(zoneId, { cells: null, km: null, hours: null });
       continue;
     }
-    // Count cells at the zone's OWN resolution (the cells the transporter
-    // actually drew), so the per-cell price matches their zone granularity.
-    const d = calculateSegmentDistanceH3(
+    const route = await resolveLandLegRoute(
       entry.lat,
       entry.lng,
       exit.lat,
       exit.lng,
       meta?.resolution ?? undefined
     );
-    perZone.set(zoneId, { cells: d.distance_h3_cells, km: d.distance_km });
+    let cells: number | null = null;
+    if (route.source === "h3") {
+      const d = calculateSegmentDistanceH3(
+        entry.lat,
+        entry.lng,
+        exit.lat,
+        exit.lng,
+        meta?.resolution ?? undefined
+      );
+      cells = d.distance_h3_cells;
+    }
+    perZone.set(zoneId, {
+      cells,
+      km: route.distance_km,
+      hours: route.duration_hours,
+    });
   }
 
-  const bySegment = new Map<number, { distance_h3_cells: number | null; distance_km: number | null }>();
+  const bySegment = new Map<
+    number,
+    { distance_h3_cells: number | null; distance_km: number | null; duration_hours: number | null }
+  >();
   for (const seg of segments) {
     const line = seg.transport_method === "air" || seg.transport_method === "sea";
     let cells = 0;
     let km = 0;
+    let hours = 0;
     let haveCells = false;
     let haveKm = false;
+    let haveHours = false;
     for (const zid of seg.zone_ids) {
       const d = perZone.get(zid);
       if (!d) continue;
@@ -424,10 +461,15 @@ function computeSegmentDistances(
         km += d.km;
         haveKm = true;
       }
+      if (d.hours != null) {
+        hours += d.hours;
+        haveHours = true;
+      }
     }
     bySegment.set(seg.segment_index, {
       distance_h3_cells: line ? null : haveCells ? cells : null,
       distance_km: haveKm ? Math.round(km * 100) / 100 : null,
+      duration_hours: haveHours ? Math.round(hours * 100) / 100 : null,
     });
   }
   return bySegment;
@@ -454,10 +496,36 @@ function nodeLabel(nodeId: string, zoneNames: Map<number, string>): string {
   return nodeId;
 }
 
+function nodeCoords(
+  nodeId: string,
+  order: OrderResponse,
+  zoneCoords: Map<number, { lat: number; lng: number }>
+): { lat: number | null; lng: number | null } {
+  if (nodeId === "sender") {
+    return { lat: order.sender_lat, lng: order.sender_lng };
+  }
+  if (nodeId === "receiver") {
+    return { lat: order.destination_lat, lng: order.destination_lng };
+  }
+  const zid = Number(nodeId);
+  if (Number.isFinite(zid)) {
+    const z = zoneCoords.get(zid);
+    if (z) return { lat: z.lat, lng: z.lng };
+  }
+  return { lat: null, lng: null };
+}
+
 function summarizeRouteStatus(
   segments: { cost_status: SegmentCostStatus; final_cost: number | null }[]
-): { status: RouteCostStatus; missing_segment_count: number; total_final_cost: number | null } {
+): {
+  status: RouteCostStatus;
+  missing_segment_count: number;
+  requested_segment_count: number;
+  total_final_cost: number | null;
+} {
   const missing = segments.filter((s) => s.cost_status === "missing").length;
+  const requested = segments.filter((s) => s.cost_status === "requested").length;
+  const pending = missing + requested;
   const withFinal = segments.filter((s) => s.final_cost != null);
   const total =
     withFinal.length > 0
@@ -465,10 +533,15 @@ function summarizeRouteStatus(
       : null;
 
   let status: RouteCostStatus = "complete";
-  if (missing === segments.length) status = "missing";
-  else if (missing > 0) status = "partial";
+  if (pending === segments.length) status = "missing";
+  else if (pending > 0) status = "partial";
 
-  return { status, missing_segment_count: missing, total_final_cost: total };
+  return {
+    status,
+    missing_segment_count: missing,
+    requested_segment_count: requested,
+    total_final_cost: total,
+  };
 }
 
 /**
@@ -522,10 +595,33 @@ export async function syncOrderRoutesFromPreview(
   return routeIds;
 }
 
+async function driverHasOrderSegmentAccess(orderId: number, driverUserId: number): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT 1
+     FROM route_segment_costs sc
+     JOIN order_routes r ON r.id = sc.route_id
+     WHERE r.order_id = $1 AND sc.transporter_id = $2
+     LIMIT 1`,
+    [orderId, driverUserId]
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
 async function getOrderForCostAccess(
   orderId: number,
   ctx: OrderContext
 ): Promise<OrderResponse> {
+  if (ctx.role === "driver") {
+    const assigned = await getOrderById(orderId, ctx);
+    if (assigned) return assigned;
+    if (await driverHasOrderSegmentAccess(orderId, ctx.userId)) {
+      const order = await getOrderById(orderId, { userId: ctx.userId, role: "admin" });
+      if (!order) throw new RouteCostError("Order not found", 404);
+      return order;
+    }
+    throw new RouteCostError("Order not found", 404);
+  }
+
   const order = await getOrderById(orderId, ctx);
   if (!order) throw new RouteCostError("Order not found", 404);
   return order;
@@ -561,7 +657,7 @@ async function assertRouteAccess(
     throw new RouteCostError("Forbidden", 403);
   }
 
-  const order = await getOrderById(Number(row.order_id), ctx);
+  const order = await getOrderForCostAccess(Number(row.order_id), ctx);
   if (!order) throw new RouteCostError("Order not found", 404);
   return { order, route: row };
 }
@@ -580,7 +676,7 @@ export async function calculateRouteCost(
   const connectionIds = parseJsonIntArray(route.connection_ids);
   const connectionsById = await loadConnectionsByIds(connectionIds);
   const segments = deriveSegmentsFromRoute(zoneIds, zoneMeta);
-  const segmentDistances = computeSegmentDistances(
+  const segmentDistances = await computeSegmentDistances(
     zoneIds,
     connectionIds,
     order,
@@ -594,21 +690,33 @@ export async function calculateRouteCost(
 
   // Preserve any manual cost a user already entered so a recalculation does
   // not silently wipe it. Keyed by segment_index, which is stable for a route.
-  const preservedManual = new Map<number, number>();
+  const preservedManual = new Map<number, { cost: number; source: "manual" | "external" }>();
+  const preservedRequested = new Set<number>();
   const existingSegs = await pool.query(
-    `SELECT segment_index, manual_cost FROM route_segment_costs
-     WHERE route_id = $1 AND cost_status = 'manual' AND manual_cost IS NOT NULL`,
+    `SELECT segment_index, manual_cost, cost_source, cost_status FROM route_segment_costs
+     WHERE route_id = $1`,
     [routeId]
   );
   for (const row of existingSegs.rows) {
-    preservedManual.set(Number(row.segment_index), Number(row.manual_cost));
+    const idx = Number(row.segment_index);
+    if (String(row.cost_status) === "manual" && row.manual_cost != null) {
+      const source = String(row.cost_source) === "external" ? "external" : "manual";
+      preservedManual.set(idx, {
+        cost: Number(row.manual_cost),
+        source,
+      });
+    } else if (String(row.cost_status) === "requested") {
+      preservedRequested.add(idx);
+    }
   }
   // Manual costs snapshotted before a full-order recalc (route ids changed)
   // are keyed by zone signature; merge them in for this route.
   if (preservedManualByZoneSig) {
     for (const seg of segments) {
       const carried = preservedManualByZoneSig.get(`${sig}::${seg.segment_index}`);
-      if (carried != null) preservedManual.set(seg.segment_index, carried);
+      if (carried != null) {
+        preservedManual.set(seg.segment_index, { cost: carried, source: "manual" });
+      }
     }
   }
 
@@ -620,26 +728,44 @@ export async function calculateRouteCost(
   let calculatedCount = 0;
   let manualCount = 0;
 
+  const bookingFeeRate = await getBookingFeeRate();
+  const landSpeedKmh = await getLandSpeedKmh();
+
   for (const seg of segments) {
-    // Rate comes from the segment's entry zone (the transporter set it there).
-    const rate = seg.from_zone_id != null ? zoneRates.get(seg.from_zone_id) ?? null : null;
-    const lineDistanceKm =
-      seg.from_zone_id != null ? zoneLineDistances.get(seg.from_zone_id) ?? null : null;
+    const zoneId = seg.from_zone_id;
+    const zoneInfo = zoneId != null ? zoneMeta.get(zoneId) : null;
+    const rate = zoneId != null ? zoneRates.get(zoneId) ?? null : null;
+    const lineDistanceKm = zoneId != null ? zoneLineDistances.get(zoneId) ?? null : null;
     const cost = calculateSegmentCost({
       segment: seg,
       order,
       rate,
       zoneCoords,
       lineDistanceKm,
+      departureTime: zoneInfo?.departure_time ?? null,
+      arrivalTime: zoneInfo?.arrival_time ?? null,
       distanceOverride: segmentDistances.get(seg.segment_index),
+      bookingFeeRate,
+      landSpeedKmh,
     });
 
-    // Re-apply a preserved manual cost (takes precedence over a fresh calc).
     const preserved = preservedManual.get(seg.segment_index);
     if (preserved != null) {
-      cost.manual_cost = preserved;
-      cost.final_cost = preserved;
+      cost.manual_cost = preserved.cost;
+      cost.final_cost = preserved.cost;
       cost.cost_status = "manual";
+      cost.cost_source = preserved.source;
+    } else if (preservedRequested.has(seg.segment_index)) {
+      cost.calculated_cost = null;
+      cost.manual_cost = null;
+      cost.final_cost = null;
+      cost.base_fee = null;
+      cost.distance_cost = null;
+      cost.waiting_cost = null;
+      cost.booking_fee = null;
+      cost.cost_status = "requested";
+      cost.cost_source = null;
+      cost.calculation_breakdown = null;
     }
 
     if (cost.cost_status === "calculated" && cost.calculated_cost != null) {
@@ -654,10 +780,10 @@ export async function calculateRouteCost(
       `INSERT INTO route_segment_costs
          (route_id, segment_index, transporter_id, from_node_id, to_node_id,
           transport_method, package_weight, package_volume,
-          distance_h3_cells, distance_km,
-          base_fee, weight_cost, volume_cost, distance_cost, time_factor_amount,
-          calculated_cost, manual_cost, final_cost, cost_status, currency, calculation_breakdown)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::jsonb)
+          distance_h3_cells, distance_km, time_hours, package_factor,
+          base_fee, weight_cost, volume_cost, distance_cost, waiting_cost, booking_fee,
+          time_factor_amount, calculated_cost, manual_cost, final_cost, cost_status, cost_source, currency, calculation_breakdown)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26::jsonb)
        RETURNING id`,
       [
         routeId,
@@ -666,19 +792,24 @@ export async function calculateRouteCost(
         seg.from_node_id,
         seg.to_node_id,
         seg.transport_method,
-        cost.package_weight,
-        cost.package_volume,
+        null,
+        null,
         cost.distance_h3_cells,
         cost.distance_km,
+        cost.time_hours,
+        cost.package_factor,
         cost.base_fee,
-        cost.weight_cost,
-        cost.volume_cost,
+        null,
+        null,
         cost.distance_cost,
-        cost.time_factor_amount,
+        cost.waiting_cost,
+        cost.booking_fee,
+        null,
         cost.calculated_cost,
         cost.manual_cost,
         cost.final_cost,
         cost.cost_status,
+        cost.cost_source,
         cost.currency,
         cost.calculation_breakdown ? JSON.stringify(cost.calculation_breakdown) : null,
       ]
@@ -693,14 +824,15 @@ export async function calculateRouteCost(
     cost_status: s.cost_status,
     final_cost: s.final_cost,
   }));
-  const { status, missing_segment_count, total_final_cost } = summarizeRouteStatus(summaryInput);
+  const { status, missing_segment_count, requested_segment_count, total_final_cost } =
+    summarizeRouteStatus(summaryInput);
 
   await pool.query(`DELETE FROM route_cost_summaries WHERE route_id = $1`, [routeId]);
   await pool.query(
     `INSERT INTO route_cost_summaries
        (route_id, order_id, total_calculated_cost, total_manual_cost, total_final_cost,
-        missing_segment_count, currency, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        missing_segment_count, requested_segment_count, currency, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
     [
       routeId,
       order.id,
@@ -708,6 +840,7 @@ export async function calculateRouteCost(
       manualCount > 0 ? Math.round(totalManual * 100) / 100 : null,
       total_final_cost,
       missing_segment_count,
+      requested_segment_count,
       segmentRows[0]?.currency ?? "CAD",
       status,
     ]
@@ -745,15 +878,21 @@ async function buildSegmentResponse(
     transport_method: String(row.transport_method),
     distance_h3_cells: row.distance_h3_cells != null ? Number(row.distance_h3_cells) : null,
     distance_km: row.distance_km != null ? Number(row.distance_km) : null,
+    time_hours: row.time_hours != null ? Number(row.time_hours) : null,
+    package_factor: row.package_factor != null ? Number(row.package_factor) : null,
     base_fee: row.base_fee != null ? Number(row.base_fee) : null,
     distance_cost: row.distance_cost != null ? Number(row.distance_cost) : null,
-    weight_cost: row.weight_cost != null ? Number(row.weight_cost) : null,
-    volume_cost: row.volume_cost != null ? Number(row.volume_cost) : null,
-    time_factor_amount: row.time_factor_amount != null ? Number(row.time_factor_amount) : null,
+    waiting_cost: row.waiting_cost != null ? Number(row.waiting_cost) : null,
+    booking_fee: row.booking_fee != null ? Number(row.booking_fee) : null,
+    weight_cost: null,
+    volume_cost: null,
+    time_factor_amount: null,
     calculated_cost: row.calculated_cost != null ? Number(row.calculated_cost) : null,
     manual_cost: row.manual_cost != null ? Number(row.manual_cost) : null,
     final_cost: row.final_cost != null ? Number(row.final_cost) : null,
     cost_status: String(row.cost_status) as SegmentCostStatus,
+    cost_source:
+      row.cost_source == null ? null : (String(row.cost_source) as SegmentCostSource),
     currency: String(row.currency ?? "CAD"),
     breakdown,
   };
@@ -767,7 +906,8 @@ async function buildRouteSummaryResponse(
   const transporterIds = parseJsonIntArray(route.transporter_ids);
   const names = await loadTransporterNames(transporterIds);
   const transporters = transporterIds.map((id) => names.get(id) ?? `Transporter #${id}`);
-  const { status, missing_segment_count, total_final_cost } = summarizeRouteStatus(segments);
+  const { status, missing_segment_count, requested_segment_count, total_final_cost } =
+    summarizeRouteStatus(segments);
 
   const summaryResult = await pool.query(
     `SELECT * FROM route_cost_summaries WHERE route_id = $1`,
@@ -785,6 +925,7 @@ async function buildRouteSummaryResponse(
     total_manual_cost: summary?.total_manual_cost != null ? Number(summary.total_manual_cost) : null,
     total_final_cost,
     missing_segment_count,
+    requested_segment_count,
     currency: String(summary?.currency ?? segments[0]?.currency ?? "CAD"),
     status,
     segments,
@@ -805,15 +946,15 @@ export async function getRouteCostSummary(
   const zoneIds = parseJsonIntArray(route.zone_ids);
   const zoneMeta = await loadZoneMetaForIds(zoneIds);
 
-  // Recompute when there are no rows yet, when any segment is still "missing"
-  // (so newly-set zone prices are picked up without pressing "Recalculate";
-  // manual entries stay 'manual', not 'missing'), or when the stored
-  // segmentation no longer matches the current per-zone derivation — which is
-  // how older rows that merged several zones into one segment get rebuilt.
-  const hasMissing = segResult.rows.some((r) => String(r.cost_status) === "missing");
+  // Recompute when there are no rows yet, when any segment is `missing` (rates
+  // newly configured), or when segmentation is stale. `requested` (e.g. air
+  // awaiting quote) is stable and must NOT trigger recalc on every read.
+  const needsRecalc = segResult.rows.some((r) =>
+    segmentNeedsRecalculation(String(r.cost_status) as SegmentCostStatus)
+  );
   const expectedSegmentCount = deriveSegmentsFromRoute(zoneIds, zoneMeta).length;
   const segmentationStale = segResult.rowCount !== expectedSegmentCount;
-  if (segResult.rowCount === 0 || hasMissing || segmentationStale) {
+  if (segResult.rowCount === 0 || needsRecalc || segmentationStale) {
     return calculateRouteCost(routeId, ctx);
   }
 
@@ -841,6 +982,175 @@ export async function applyManualSegmentCost(
   manualCost: number,
   ctx: OrderContext
 ): Promise<RouteSegmentCostResponse> {
+  return applyQuotedSegmentCost(segmentCostId, manualCost, "manual", ctx);
+}
+
+export async function applyExternalSegmentCost(
+  segmentCostId: number,
+  quotedCost: number,
+  ctx: OrderContext
+): Promise<RouteSegmentCostResponse> {
+  return applyQuotedSegmentCost(segmentCostId, quotedCost, "external", ctx);
+}
+
+export { isExternalQuoteConfigured };
+
+export async function fetchExternalSegmentQuote(
+  segmentCostId: number,
+  ctx: OrderContext
+): Promise<RouteSegmentCostResponse> {
+  if (!isExternalQuoteConfigured()) {
+    throw new RouteCostError(
+      "External quote webhook is not configured (EXTERNAL_QUOTE_WEBHOOK_URL)",
+      503
+    );
+  }
+
+  const segResult = await pool.query(
+    `SELECT sc.*, r.order_id, r.id AS route_id, r.zone_ids, o.sender_user_id, o.receiver_user_id
+     FROM route_segment_costs sc
+     JOIN order_routes r ON r.id = sc.route_id
+     JOIN orders o ON o.id = r.order_id
+     WHERE sc.id = $1`,
+    [segmentCostId]
+  );
+  if (segResult.rowCount === 0) throw new RouteCostError("Segment cost not found", 404);
+  const seg = segResult.rows[0];
+  const senderId = Number(seg.sender_user_id);
+  const receiverId = Number(seg.receiver_user_id);
+
+  const isParty =
+    ctx.role === "admin" ||
+    (ctx.role === "sender" && ctx.userId === senderId) ||
+    (ctx.role === "receiver" && ctx.userId === receiverId);
+  if (!isParty) {
+    throw new RouteCostError("Only the order sender, receiver, or an admin can fetch external quotes", 403);
+  }
+
+  const status = String(seg.cost_status);
+  const method = String(seg.transport_method);
+  if (status === "manual") {
+    throw new RouteCostError("Segment already has a manual or external cost", 400);
+  }
+  if (status === "calculated" && method !== "air") {
+    throw new RouteCostError("External quotes apply to requested air/sea segments or missing costs", 400);
+  }
+  if (status !== "requested" && status !== "missing" && method !== "air") {
+    throw new RouteCostError("This segment does not need an external quote", 400);
+  }
+
+  const order = await getOrderById(Number(seg.order_id), ctx);
+  if (!order) throw new RouteCostError("Order not found", 404);
+
+  const zoneIds = parseJsonIntArray(seg.zone_ids);
+  const zoneMeta = await loadZoneMetaForIds(zoneIds);
+  const zoneCoords = await loadZoneCentroids(zoneIds);
+  const zoneNames = new Map<number, string>();
+  for (const [id, meta] of zoneMeta) {
+    zoneNames.set(id, meta.zone_name);
+  }
+
+  const from = nodeCoords(String(seg.from_node_id), order, zoneCoords);
+  const to = nodeCoords(String(seg.to_node_id), order, zoneCoords);
+
+  const payload: ExternalQuoteRequest = {
+    transport_method: method,
+    segment_index: Number(seg.segment_index),
+    segment_cost_id: segmentCostId,
+    order_id: order.id,
+    from: {
+      lat: from.lat,
+      lng: from.lng,
+      label: nodeLabel(String(seg.from_node_id), zoneNames),
+    },
+    to: {
+      lat: to.lat,
+      lng: to.lng,
+      label: nodeLabel(String(seg.to_node_id), zoneNames),
+    },
+    weight_lbs: order.weight_lbs,
+    package_type: order.package_type,
+    package_factor: order.package_factor,
+    dimensions_in: {
+      length: order.package_length,
+      width: order.package_width,
+      height: order.package_height,
+    },
+    currency: String(seg.currency ?? "CAD"),
+  };
+
+  try {
+    const quote = await fetchExternalQuote(payload);
+    return applyQuotedSegmentCost(segmentCostId, quote.quoted_cost, "external", ctx);
+  } catch (err) {
+    if (err instanceof ExternalQuoteError) {
+      throw new RouteCostError(err.message, err.status);
+    }
+    throw err;
+  }
+}
+
+export async function requestSegmentQuote(
+  segmentCostId: number,
+  ctx: OrderContext
+): Promise<RouteSegmentCostResponse> {
+  const segResult = await pool.query(
+    `SELECT sc.*, r.order_id, r.id AS route_id, r.transporter_ids, r.zone_ids, o.sender_user_id, o.receiver_user_id
+     FROM route_segment_costs sc
+     JOIN order_routes r ON r.id = sc.route_id
+     JOIN orders o ON o.id = r.order_id
+     WHERE sc.id = $1`,
+    [segmentCostId]
+  );
+  if (segResult.rowCount === 0) throw new RouteCostError("Segment cost not found", 404);
+  const seg = segResult.rows[0];
+  const orderId = Number(seg.order_id);
+  const senderId = Number(seg.sender_user_id);
+  const receiverId = Number(seg.receiver_user_id);
+
+  const isParty =
+    ctx.role === "admin" ||
+    (ctx.role === "sender" && ctx.userId === senderId) ||
+    (ctx.role === "receiver" && ctx.userId === receiverId);
+  if (!isParty) {
+    throw new RouteCostError("Only the order sender, receiver, or an admin can request a quote", 403);
+  }
+
+  const status = String(seg.cost_status);
+  if (status === "manual") {
+    throw new RouteCostError("Manual costs cannot be reverted to a quote request", 400);
+  }
+  if (status === "requested") {
+    throw new RouteCostError("A quote has already been requested for this segment", 400);
+  }
+  if (String(seg.transport_method) === "air") {
+    throw new RouteCostError("Air segments always require a quote", 400);
+  }
+
+  await pool.query(
+    `UPDATE route_segment_costs
+     SET calculated_cost = NULL, manual_cost = NULL, final_cost = NULL,
+         base_fee = NULL, distance_cost = NULL, waiting_cost = NULL, booking_fee = NULL,
+         cost_status = 'requested', cost_source = NULL, calculation_breakdown = NULL,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [segmentCostId]
+  );
+
+  await recalculateRouteSummary(Number(seg.route_id));
+
+  const zoneMeta = await loadZoneMetaForIds(parseJsonIntArray(seg.zone_ids));
+  const names = await loadTransporterNames([Number(seg.transporter_id)]);
+  const updated = await pool.query(`SELECT * FROM route_segment_costs WHERE id = $1`, [segmentCostId]);
+  return buildSegmentResponse(updated.rows[0], zoneMeta, names);
+}
+
+async function applyQuotedSegmentCost(
+  segmentCostId: number,
+  quotedCost: number,
+  source: "manual" | "external",
+  ctx: OrderContext
+): Promise<RouteSegmentCostResponse> {
   const segResult = await pool.query(
     `SELECT sc.*, r.order_id, r.id AS route_id, r.transporter_ids, r.zone_ids
      FROM route_segment_costs sc
@@ -861,9 +1171,9 @@ export async function applyManualSegmentCost(
 
   await pool.query(
     `UPDATE route_segment_costs
-     SET manual_cost = $2, final_cost = $2, cost_status = 'manual', updated_at = NOW()
+     SET manual_cost = $2, final_cost = $2, cost_status = 'manual', cost_source = $3, updated_at = NOW()
      WHERE id = $1`,
-    [segmentCostId, manualCost]
+    [segmentCostId, quotedCost, source]
   );
 
   await recalculateRouteSummary(Number(seg.route_id));
@@ -900,20 +1210,22 @@ async function recalculateRouteSummary(routeId: number): Promise<void> {
     }
   }
 
-  const { status, missing_segment_count, total_final_cost } = summarizeRouteStatus(segments);
+  const { status, missing_segment_count, requested_segment_count, total_final_cost } =
+    summarizeRouteStatus(segments);
   const routeResult = await pool.query(`SELECT order_id FROM order_routes WHERE id = $1`, [routeId]);
   const orderId = Number(routeResult.rows[0]?.order_id);
 
   await pool.query(
     `INSERT INTO route_cost_summaries
        (route_id, order_id, total_calculated_cost, total_manual_cost, total_final_cost,
-        missing_segment_count, currency, status, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+        missing_segment_count, requested_segment_count, currency, status, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
      ON CONFLICT (route_id) DO UPDATE SET
        total_calculated_cost = EXCLUDED.total_calculated_cost,
        total_manual_cost = EXCLUDED.total_manual_cost,
        total_final_cost = EXCLUDED.total_final_cost,
        missing_segment_count = EXCLUDED.missing_segment_count,
+       requested_segment_count = EXCLUDED.requested_segment_count,
        status = EXCLUDED.status,
        updated_at = NOW()`,
     [
@@ -923,6 +1235,7 @@ async function recalculateRouteSummary(routeId: number): Promise<void> {
       manualCount > 0 ? Math.round(totalManual * 100) / 100 : null,
       total_final_cost,
       missing_segment_count,
+      requested_segment_count,
       String(segResult.rows[0]?.currency ?? "CAD"),
       status,
     ]
@@ -944,8 +1257,10 @@ async function resyncAndCostOrder(
 async function buildOrderRouteComparison(
   orderId: number,
   ctx: OrderContext,
-  liveChains?: RouteChain[]
+  liveChains?: RouteChain[],
+  order?: OrderResponse
 ): Promise<OrderRouteCostComparisonResponse> {
+  const orderRow = order ?? (await getOrderForCostAccess(orderId, ctx));
   const routesResult = await pool.query(
     `SELECT * FROM order_routes WHERE order_id = $1 ORDER BY route_index`,
     [orderId]
@@ -973,7 +1288,25 @@ async function buildOrderRouteComparison(
   });
 
   const currency = routes[0]?.currency ?? "CAD";
-  return { order_id: orderId, currency, routes };
+  const bookingFeeRate = await getBookingFeeRate();
+  const dims =
+    orderRow.package_length != null &&
+    orderRow.package_width != null &&
+    orderRow.package_height != null
+      ? `${orderRow.package_length} × ${orderRow.package_width} × ${orderRow.package_height} in`
+      : orderRow.dimensions || null;
+  const weightLbs = orderRow.weight_lbs != null ? Number(orderRow.weight_lbs) : null;
+
+  return {
+    order_id: orderId,
+    currency,
+    booking_fee_rate: bookingFeeRate,
+    package_type: orderRow.package_type,
+    package_factor: orderRow.package_factor,
+    package_weight_lbs: weightLbs,
+    package_dimensions_in: dims,
+    routes,
+  };
 }
 
 export async function recalculateRouteCostsForOrder(
@@ -986,7 +1319,7 @@ export async function recalculateRouteCostsForOrder(
     await resyncAndCostOrder(order, ctx, chains);
     return chains;
   });
-  return buildOrderRouteComparison(orderId, ctx, liveChains);
+  return buildOrderRouteComparison(orderId, ctx, liveChains, order);
 }
 
 export async function compareOrderRoutes(
@@ -1006,9 +1339,71 @@ export async function compareOrderRoutes(
     });
   }
 
-  return buildOrderRouteComparison(orderId, ctx, liveChains);
+  return buildOrderRouteComparison(orderId, ctx, liveChains, order);
 }
 
 export async function markMissingCostSegments(routeId: number, ctx: OrderContext): Promise<void> {
   await getRouteCostSummary(routeId, ctx);
+}
+
+export async function listTransporterQuoteRequests(
+  ctx: OrderContext
+): Promise<TransporterQuoteRequestItem[]> {
+  if (ctx.role !== "driver" && ctx.role !== "admin") {
+    throw new RouteCostError("Forbidden", 403);
+  }
+
+  const params: unknown[] = [];
+  let transporterFilter = "";
+  if (ctx.role === "driver") {
+    params.push(ctx.userId);
+    transporterFilter = `AND sc.transporter_id = $${params.length}`;
+  }
+
+  const result = await pool.query(
+    `SELECT sc.*, r.id AS route_id, r.route_label, r.zone_ids, r.order_id,
+            o.status AS order_status, o.sender_address, o.destination_address,
+            o.package_type, o.weight_lbs, o.dimensions,
+            o.package_length, o.package_width, o.package_height
+     FROM route_segment_costs sc
+     JOIN order_routes r ON r.id = sc.route_id
+     JOIN orders o ON o.id = r.order_id
+     WHERE sc.cost_status IN ('requested', 'missing')
+     ${transporterFilter}
+     ORDER BY
+       CASE WHEN sc.cost_status = 'requested' THEN 0 ELSE 1 END,
+       sc.updated_at DESC`,
+    params
+  );
+
+  const items: TransporterQuoteRequestItem[] = [];
+  for (const row of result.rows) {
+    const zoneIds = parseJsonIntArray(row.zone_ids);
+    const zoneMeta = await loadZoneMetaForIds(zoneIds);
+    const names = await loadTransporterNames([Number(row.transporter_id)]);
+    const segment = await buildSegmentResponse(row, zoneMeta, names);
+
+    const dims =
+      row.package_length != null &&
+      row.package_width != null &&
+      row.package_height != null
+        ? `${row.package_length} × ${row.package_width} × ${row.package_height} in`
+        : row.dimensions || null;
+
+    items.push({
+      order_id: Number(row.order_id),
+      order_status: String(row.order_status),
+      sender_address: String(row.sender_address ?? ""),
+      destination_address: String(row.destination_address ?? ""),
+      package_type: row.package_type != null ? String(row.package_type) : null,
+      package_weight_lbs: row.weight_lbs != null ? Number(row.weight_lbs) : null,
+      package_dimensions_in: dims,
+      route_id: Number(row.route_id),
+      route_label: String(row.route_label),
+      segment,
+      updated_at: new Date(row.updated_at).toISOString(),
+    });
+  }
+
+  return items;
 }
