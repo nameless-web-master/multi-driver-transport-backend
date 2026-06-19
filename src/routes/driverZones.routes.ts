@@ -38,10 +38,13 @@ driverZonesRouter.get("/", async (req: AuthenticatedRequest, res: Response) => {
     const ownerParam = req.query.owner_user_id;
     const ownerUserId = typeof ownerParam === "string" && ownerParam ? Number(ownerParam) : undefined;
     const availableParam = req.query.available;
+    const activeParam = req.query.active;
     // Per spec, senders see all zones. They can opt into ?available=true for a filtered view.
     const availableOnly = availableParam === "true" || availableParam === "1";
+    const activeOnly = activeParam === "true" || activeParam === "1";
     const zones = await listDriverZones(ctx, {
       availableOnly,
+      activeOnly,
       ownerUserId: Number.isFinite(ownerUserId) ? ownerUserId : undefined,
     });
     res.json(zones);

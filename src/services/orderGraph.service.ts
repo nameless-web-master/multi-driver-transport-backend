@@ -1,14 +1,10 @@
 import { cellToLatLng, isValidCell, latLngToCell } from "h3-js";
 import { pool } from "../database";
 import type { AdjacentCellPair, ConnectionType } from "../models/zoneConnection.model";
-import type {
-  OrderGraph,
-  OrderGraphEdge,
-  OrderGraphNode,
-  OrderGraphZoneNode,
-} from "../models/orderGraph.model";
+import type { OrderGraph, OrderGraphEdge, OrderGraphNode, OrderGraphZoneNode } from "../models/orderGraph.model";
 import { OrderError, getOrderById, type OrderContext } from "./order.service";
 import { recalculateAllZoneConnections } from "./zoneConnection.service";
+import { buildZoneScheduleFields, isZoneScheduleActive, parseScheduleFromRow } from "./zoneSchedule.service";
 
 /**
  * Milestone 3 — Order-based transporter graph.
@@ -156,6 +152,11 @@ async function loadZoneMeta(): Promise<ZoneMetaRow[]> {
   const result = await pool.query(
     `SELECT z.id, z.owner_user_id, z.zone_name, z.resolution, z.transport_mode,
             z.zone_type, z.boundary,
+            z.operation_date, z.operation_start_date, z.operation_end_date,
+            z.schedule_pattern, z.weekday_start, z.weekday_end,
+            z.month_day_start, z.month_day_end,
+            z.operating_start_time, z.operating_end_time,
+            z.departure_time, z.arrival_time,
             jsonb_array_length(z.h3_cells) AS cell_count,
             COALESCE(u.full_name, '') AS transport_name
      FROM driver_zones z
@@ -163,17 +164,29 @@ async function loadZoneMeta(): Promise<ZoneMetaRow[]> {
      WHERE z.available = TRUE
      ORDER BY z.id`
   );
-  return result.rows.map((row) => ({
-    id: Number(row.id),
-    owner_user_id: Number(row.owner_user_id),
-    zone_name: String(row.zone_name ?? ""),
-    resolution: Number(row.resolution ?? 0),
-    transport_mode: row.transport_mode == null ? null : String(row.transport_mode),
-    transport_name: String(row.transport_name ?? ""),
-    cell_count: Number(row.cell_count ?? 0),
-    zone_type: row.zone_type == null ? null : String(row.zone_type),
-    boundary: row.boundary,
-  }));
+  const now = new Date();
+  return result.rows
+    .map((row) => ({
+      id: Number(row.id),
+      owner_user_id: Number(row.owner_user_id),
+      zone_name: String(row.zone_name ?? ""),
+      resolution: Number(row.resolution ?? 0),
+      transport_mode: row.transport_mode == null ? null : String(row.transport_mode),
+      transport_name: String(row.transport_name ?? ""),
+      cell_count: Number(row.cell_count ?? 0),
+      zone_type: row.zone_type == null ? null : String(row.zone_type),
+      boundary: row.boundary,
+    }))
+    .filter((_, idx) => {
+      const schedule = parseScheduleFromRow(result.rows[idx]);
+      return isZoneScheduleActive(
+        buildZoneScheduleFields({
+          transport_mode: String(result.rows[idx].transport_mode ?? "land"),
+          ...schedule,
+        }),
+        now
+      );
+    });
 }
 
 async function loadConnections(): Promise<ConnectionRow[]> {

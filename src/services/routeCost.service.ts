@@ -1302,6 +1302,7 @@ async function buildOrderRouteComparison(
     currency,
     booking_fee_rate: bookingFeeRate,
     package_type: orderRow.package_type,
+    packages: orderRow.packages,
     package_factor: orderRow.package_factor,
     package_weight_lbs: weightLbs,
     package_dimensions_in: dims,

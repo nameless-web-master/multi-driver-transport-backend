@@ -5,7 +5,7 @@ import type {
   SegmentCostStatus,
 } from "../models/routeCost.model";
 import type { OrderResponse } from "../models/order.model";
-import { packageFactorForType, type PackageType } from "../models/package.model";
+import { packageFactorForType, totalPackageFactorForEntries, type PackageType, type OrderPackageEntry } from "../models/package.model";
 import { DEFAULT_BOOKING_FEE_RATE, DEFAULT_LAND_SPEED_KMH } from "../models/pricing.model";
 import { ORDER_H3_RESOLUTION } from "./order.service";
 
@@ -102,6 +102,7 @@ export interface SegmentCostInput {
   order: Pick<
     OrderResponse,
     | "package_type"
+    | "packages"
     | "package_factor"
     | "sender_lat"
     | "sender_lng"
@@ -157,10 +158,14 @@ export function transportRequiresCostRequest(transportMethod: string): boolean {
 
 export function calculatePackageFactor(
   packageType: PackageType | null | undefined,
-  explicitFactor: number | null | undefined
+  explicitFactor: number | null | undefined,
+  packages?: readonly OrderPackageEntry[] | null
 ): number {
   if (explicitFactor != null && Number.isFinite(explicitFactor) && explicitFactor > 0) {
     return explicitFactor;
+  }
+  if (packages && packages.length > 0) {
+    return totalPackageFactorForEntries(packages);
   }
   if (packageType) {
     return packageFactorForType(packageType);
@@ -331,7 +336,11 @@ function emptyResult(
 export function calculateSegmentCost(input: SegmentCostInput): SegmentCostResult {
   const { segment, order, rate, zoneCoords } = input;
   const currency = rate?.currency ?? "CAD";
-  const packageFactor = calculatePackageFactor(order.package_type, input.packageFactor ?? order.package_factor);
+  const packageFactor = calculatePackageFactor(
+    order.package_type,
+    input.packageFactor ?? order.package_factor,
+    order.packages
+  );
   const bookingFeeRate = input.bookingFeeRate ?? DEFAULT_BOOKING_FEE_RATE;
   const method = segment.transport_method;
 

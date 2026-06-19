@@ -12,8 +12,15 @@ import {
   UpdateOrderPackageRequest,
   UpdateOrderStatusRequest,
 } from "../schemas/order.schema";
-import { packageFactorForType, isPackageType } from "../models/package.model";
-import type { PackageType } from "../models/package.model";
+import {
+  MAX_PACKAGES,
+  normalizeOrderPackages,
+  parseOrderPackagesFromStorage,
+  rollupOrderTotalsFromPackages,
+  totalPackageFactorForEntries,
+  isPackageType,
+} from "../models/package.model";
+import type { OrderPackageEntry, PackageType } from "../models/package.model";
 
 /**
  * H3 resolution at which order pickup / delivery coordinates are indexed.
@@ -88,6 +95,16 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
     shipping_method: String(row.shipping_method ?? ""),
     package_description: String(row.package_description ?? ""),
     package_type: isPackageType(row.package_type) ? row.package_type : null,
+    packages: parseOrderPackagesFromStorage(
+      row.packages,
+      isPackageType(row.package_type) ? row.package_type : null,
+      {
+        weight_lbs: toNullable(row.weight_lbs),
+        package_length: toNullable(row.package_length),
+        package_width: toNullable(row.package_width),
+        package_height: toNullable(row.package_height),
+      }
+    ),
     package_factor: toNullable(row.package_factor),
     weight_lbs:
       toNullable(row.weight_lbs) ??
@@ -133,6 +150,7 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
     shipping_method: order.shipping_method,
     package_description: order.package_description,
     package_type: order.package_type,
+    packages: order.packages,
     package_factor: order.package_factor,
     weight_lbs: order.weight_lbs,
     package_weight_unit: order.package_weight_unit,
@@ -192,17 +210,27 @@ export async function createOrder(
   const pickupH3 = coordsToH3(senderLat, senderLng, ORDER_H3_RESOLUTION);
   const deliveryH3 = coordsToH3(destinationLat, destinationLng, ORDER_H3_RESOLUTION);
 
-  const packageLength = data.package_length ?? null;
-  const packageWidth = data.package_width ?? null;
-  const packageHeight = data.package_height ?? null;
-  const packageType: PackageType = data.package_type;
-  const packageFactor = packageFactorForType(packageType);
-  const weightLbs = data.weight_lbs ?? null;
-  const dimensionsText =
-    data.dimensions?.trim() ||
-    (packageLength != null && packageWidth != null && packageHeight != null
-      ? `${packageLength} × ${packageWidth} × ${packageHeight} in`
-      : "");
+  const packages: OrderPackageEntry[] = normalizeOrderPackages(
+    data.packages,
+    data.package_type ?? null,
+    {
+      weight_lbs: data.weight_lbs,
+      package_length: data.package_length,
+      package_width: data.package_width,
+      package_height: data.package_height,
+    }
+  );
+  if (packages.length > MAX_PACKAGES) {
+    throw new OrderError(`At most ${MAX_PACKAGES} packages are allowed`, 400);
+  }
+  const packageType: PackageType = packages[0].package_type;
+  const packageFactor = totalPackageFactorForEntries(packages);
+  const rolledUp = rollupOrderTotalsFromPackages(packages);
+  const weightLbs = rolledUp.weight_lbs;
+  const packageLength = rolledUp.package_length;
+  const packageWidth = rolledUp.package_width;
+  const packageHeight = rolledUp.package_height;
+  const dimensionsText = data.dimensions?.trim() || rolledUp.dimensions;
 
   const insert = await pool.query(
     `INSERT INTO orders
@@ -212,14 +240,14 @@ export async function createOrder(
         receiver_phone, notes,
         pickup_h3, delivery_h3, h3_resolution,
         source_name, source_contact, payment_method, shipping_method,
-        package_description, package_type, package_factor,
+        package_description, package_type, packages, package_factor,
         weight_kg, weight_lbs, package_weight_unit,
         package_length, package_width, package_height, package_dimension_unit,
         dimensions,
         status, submitted_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-             $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
-             $22, $23, $24, $25, $26, $27, $28, $29,
+             $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+             $23, $24, $25, $26, $27, $28, $29, $30,
              'submitted', NOW())
      RETURNING id`,
     [
@@ -243,6 +271,7 @@ export async function createOrder(
       data.shipping_method ?? "",
       data.package_description ?? "",
       packageType,
+      JSON.stringify(packages),
       packageFactor,
       weightLbs,
       weightLbs,
@@ -370,42 +399,51 @@ export async function updateOrderPackage(
     throw new OrderError("Package details can only be edited while the order is submitted", 400);
   }
 
-  const packageType = data.package_type ?? existing.package_type ?? "medium";
-  const packageFactor = packageFactorForType(packageType);
-  const weightLbs = data.weight_lbs !== undefined ? data.weight_lbs : existing.weight_lbs;
-  const packageLength =
-    data.package_length !== undefined ? data.package_length : existing.package_length;
-  const packageWidth = data.package_width !== undefined ? data.package_width : existing.package_width;
-  const packageHeight =
-    data.package_height !== undefined ? data.package_height : existing.package_height;
+  const packages: OrderPackageEntry[] =
+    data.packages != null || data.package_type != null
+      ? normalizeOrderPackages(data.packages, data.package_type ?? existing.package_type, {
+          weight_lbs: data.weight_lbs,
+          package_length: data.package_length,
+          package_width: data.package_width,
+          package_height: data.package_height,
+        })
+      : existing.packages;
+  if (packages.length > MAX_PACKAGES) {
+    throw new OrderError(`At most ${MAX_PACKAGES} packages are allowed`, 400);
+  }
+  const packageType = packages[0]?.package_type ?? existing.package_type ?? "medium";
+  const packageFactor = totalPackageFactorForEntries(packages);
+  const rolledUp = rollupOrderTotalsFromPackages(packages);
+  const weightLbs = rolledUp.weight_lbs;
+  const packageLength = rolledUp.package_length;
+  const packageWidth = rolledUp.package_width;
+  const packageHeight = rolledUp.package_height;
   const packageDescription =
     data.package_description !== undefined
       ? data.package_description
       : existing.package_description;
-  const dimensionsText =
-    data.dimensions?.trim() ||
-    (packageLength != null && packageWidth != null && packageHeight != null
-      ? `${packageLength} × ${packageWidth} × ${packageHeight} in`
-      : existing.dimensions);
+  const dimensionsText = data.dimensions?.trim() || rolledUp.dimensions;
 
   await pool.query(
     `UPDATE orders
      SET package_type = $2,
-         package_factor = $3,
-         weight_lbs = $4,
-         weight_kg = $4,
+         packages = $3::jsonb,
+         package_factor = $4,
+         weight_lbs = $5,
+         weight_kg = $5,
          package_weight_unit = 'lb',
-         package_length = $5,
-         package_width = $6,
-         package_height = $7,
+         package_length = $6,
+         package_width = $7,
+         package_height = $8,
          package_dimension_unit = 'in',
-         package_description = $8,
-         dimensions = $9,
+         package_description = $9,
+         dimensions = $10,
          updated_at = NOW()
      WHERE id = $1`,
     [
       id,
       packageType,
+      JSON.stringify(packages),
       packageFactor,
       weightLbs,
       packageLength,
@@ -468,6 +506,10 @@ export async function backfillOrderPricing(): Promise<number> {
     `UPDATE orders
      SET package_type = COALESCE(package_type, 'medium'),
          package_factor = COALESCE(package_factor, 0.05),
+         packages = COALESCE(
+           packages,
+           jsonb_build_array(jsonb_build_object('package_type', COALESCE(package_type, 'medium')))
+         ),
          weight_lbs = COALESCE(
            weight_lbs,
            CASE
@@ -488,6 +530,7 @@ export async function backfillOrderPricing(): Promise<number> {
          package_dimension_unit = 'in'
      WHERE package_type IS NULL
         OR package_factor IS NULL
+        OR packages IS NULL
         OR weight_lbs IS NULL
         OR package_weight_unit IS DISTINCT FROM 'lb'
         OR package_dimension_unit IS DISTINCT FROM 'in'

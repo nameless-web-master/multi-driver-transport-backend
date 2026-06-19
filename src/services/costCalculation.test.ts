@@ -19,6 +19,28 @@ describe("calculatePackageFactor", () => {
     assert.equal(calculatePackageFactor(null, null), 0.05);
   });
 
+  it("sums factors for multiple packages", () => {
+    assert.equal(
+      calculatePackageFactor(null, null, [
+        {
+          package_type: "small",
+          weight_lbs: 5,
+          package_length: 10,
+          package_width: 8,
+          package_height: 6,
+        },
+        {
+          package_type: "medium",
+          weight_lbs: 12,
+          package_length: 20,
+          package_width: 15,
+          package_height: 10,
+        },
+      ]),
+      0.07
+    );
+  });
+
   it("prefers explicit factor when set", () => {
     assert.equal(calculatePackageFactor("small", 0.15), 0.15);
   });

@@ -16,6 +16,7 @@ import type {
   ZoneConnectionRow,
 } from "../models/zoneConnection.model";
 import type { UserRole } from "../models/userRole.model";
+import { isZoneScheduleActive, buildZoneScheduleFields, parseScheduleFromRow } from "./zoneSchedule.service";
 import type {
   ListConnectionFilters,
   RecalcStats,
@@ -435,7 +436,10 @@ interface ZoneSlim {
 /** Columns every zone fetch needs so hub detection has the terminal coords. */
 const ZONE_SLIM_COLUMNS = `id, owner_user_id, h3_cells, transport_mode, resolution,
   departure_hub_name, departure_hub_lat, departure_hub_lng,
-  arrival_hub_name, arrival_hub_lat, arrival_hub_lng`;
+  arrival_hub_name, arrival_hub_lat, arrival_hub_lng,
+  operation_date, operation_start_date, operation_end_date,
+  schedule_pattern, weekday_start, weekday_end, month_day_start, month_day_end,
+  departure_time, arrival_time, operating_start_time, operating_end_time`;
 
 function parseHubPoint(
   row: Record<string, unknown>,
@@ -488,7 +492,19 @@ async function fetchActiveZones(client: PoolClient | typeof pool): Promise<ZoneS
      WHERE available = TRUE
      ORDER BY id`
   );
-  return result.rows.map(parseZoneRow);
+  const now = new Date();
+  return result.rows
+    .map(parseZoneRow)
+    .filter((_, idx) => {
+      const schedule = parseScheduleFromRow(result.rows[idx]);
+      return isZoneScheduleActive(
+        buildZoneScheduleFields({
+          transport_mode: String(result.rows[idx].transport_mode ?? "land"),
+          ...schedule,
+        }),
+        now
+      );
+    });
 }
 
 async function fetchZoneById(

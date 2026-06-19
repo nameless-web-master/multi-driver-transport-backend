@@ -20,6 +20,13 @@ import {
   deactivateConnectionsForZone,
   recalculateConnectionsForZone,
 } from "./zoneConnection.service";
+import {
+  assertCompleteZoneSchedule,
+  buildZoneScheduleFields,
+  isZoneScheduleActive,
+  parseScheduleFromRow,
+  parseSchedulePattern,
+} from "./zoneSchedule.service";
 
 const ZONE_SELECT = `
   SELECT z.id, z.owner_user_id, z.driver_name, z.zone_name, z.resolution, z.h3_cells,
@@ -27,6 +34,10 @@ const ZONE_SELECT = `
          z.departure_hub_name, z.departure_hub_lat, z.departure_hub_lng,
          z.arrival_hub_name, z.arrival_hub_lat, z.arrival_hub_lng,
          z.departure_time, z.arrival_time,
+         z.operation_date, z.operation_start_date, z.operation_end_date,
+         z.schedule_pattern, z.weekday_start, z.weekday_end,
+         z.month_day_start, z.month_day_end,
+         z.operating_start_time, z.operating_end_time,
          z.base_fee, z.cost_per_h3_cell, z.cost_per_km, z.cost_per_hour, z.cost_per_kg,
          z.cost_per_volume_unit, z.time_of_day_factor, z.minimum_fee,
          z.currency, z.available, z.trust_payment_forwarder,
@@ -63,8 +74,16 @@ function parseHubFromRow(
   return { name: nameStr, lat: latN, lng: lngN };
 }
 
-function rowToResponse(row: DriverZoneRow & { driver_trustworthiness?: number }): DriverZoneResponse {
+function rowToResponse(
+  row: DriverZoneRow & { driver_trustworthiness?: number },
+  now: Date = new Date()
+): DriverZoneResponse {
   const cells = Array.isArray(row.h3_cells) ? row.h3_cells : [];
+  const schedule = parseScheduleFromRow(row as unknown as Record<string, unknown>);
+  const scheduleFields = buildZoneScheduleFields({
+    transport_mode: row.transport_mode,
+    ...schedule,
+  });
   return {
     id: row.id,
     owner_user_id: row.owner_user_id,
@@ -79,6 +98,16 @@ function rowToResponse(row: DriverZoneRow & { driver_trustworthiness?: number })
     arrival_hub: row.arrival_hub,
     departure_time: row.departure_time,
     arrival_time: row.arrival_time,
+    operation_date: schedule.operation_date,
+    operation_start_date: schedule.operation_start_date,
+    operation_end_date: schedule.operation_end_date,
+    schedule_pattern: schedule.schedule_pattern,
+    weekday_start: schedule.weekday_start,
+    weekday_end: schedule.weekday_end,
+    month_day_start: schedule.month_day_start,
+    month_day_end: schedule.month_day_end,
+    operating_start_time: schedule.operating_start_time,
+    operating_end_time: schedule.operating_end_time,
     base_fee: row.base_fee,
     cost_per_h3_cell: row.cost_per_h3_cell,
     cost_per_km: row.cost_per_km,
@@ -91,6 +120,7 @@ function rowToResponse(row: DriverZoneRow & { driver_trustworthiness?: number })
     available: row.available,
     trust_payment_forwarder: row.trust_payment_forwarder,
     driver_trustworthiness: row.driver_trustworthiness ?? 0,
+    schedule_active: isZoneScheduleActive(scheduleFields, now),
     created_at: row.created_at.toISOString(),
     updated_at: row.updated_at.toISOString(),
   };
@@ -136,6 +166,8 @@ function parseRow(row: Record<string, unknown>): DriverZoneRow & { driver_trustw
   const transport_mode: TransportMode =
     modeRaw === "air" || modeRaw === "sea" ? (modeRaw as TransportMode) : "land";
 
+  const schedule = parseScheduleFromRow(row);
+
   return {
     id: Number(row.id),
     owner_user_id: Number(row.owner_user_id),
@@ -147,8 +179,18 @@ function parseRow(row: Record<string, unknown>): DriverZoneRow & { driver_trustw
     boundary: parseBoundary(row.boundary),
     departure_hub: parseHubFromRow(row, "departure"),
     arrival_hub: parseHubFromRow(row, "arrival"),
-    departure_time: row.departure_time == null ? null : String(row.departure_time),
-    arrival_time: row.arrival_time == null ? null : String(row.arrival_time),
+    departure_time: schedule.departure_time,
+    arrival_time: schedule.arrival_time,
+    operation_date: schedule.operation_date,
+    operation_start_date: schedule.operation_start_date,
+    operation_end_date: schedule.operation_end_date,
+    schedule_pattern: schedule.schedule_pattern,
+    weekday_start: schedule.weekday_start,
+    weekday_end: schedule.weekday_end,
+    month_day_start: schedule.month_day_start,
+    month_day_end: schedule.month_day_end,
+    operating_start_time: schedule.operating_start_time,
+    operating_end_time: schedule.operating_end_time,
     base_fee: toNullableNum(row.base_fee),
     cost_per_h3_cell: toNullableNum(row.cost_per_h3_cell),
     cost_per_km: toNullableNum(row.cost_per_km),
@@ -340,6 +382,8 @@ export interface ZoneAccessContext {
 export interface ListDriverZonesOptions {
   /** Sender/receiver: only see zones marked available. Driver/admin: see all. */
   availableOnly?: boolean;
+  /** Only zones whose operation schedule is active right now. */
+  activeOnly?: boolean;
   ownerUserId?: number;
 }
 
@@ -372,7 +416,12 @@ export async function listDriverZones(
     `${ZONE_SELECT} ${whereSql} ORDER BY z.created_at DESC`,
     params
   );
-  return result.rows.map((r) => rowToResponse(parseRow(r)));
+  const now = new Date();
+  let zones = result.rows.map((r) => rowToResponse(parseRow(r), now));
+  if (options.activeOnly) {
+    zones = zones.filter((z) => z.schedule_active);
+  }
+  return zones;
 }
 
 export async function getDriverZoneById(
@@ -393,6 +442,42 @@ export async function getDriverZoneById(
   return rowToResponse(parseRow(result.rows[0]));
 }
 
+function scheduleInputForWrite(input: {
+  operation_date?: string | null;
+  operation_start_date?: string | null;
+  operation_end_date?: string | null;
+  schedule_pattern?: string | null;
+  weekday_start?: number | null;
+  weekday_end?: number | null;
+  month_day_start?: number | null;
+  month_day_end?: number | null;
+  operating_start_time?: string | null;
+  operating_end_time?: string | null;
+  departure_time?: string | null;
+  arrival_time?: string | null;
+  transport_mode: string;
+}) {
+  const start = input.operation_start_date ?? input.operation_date ?? null;
+  const end = input.operation_end_date ?? input.operation_date ?? start;
+  const schedule = {
+    operation_date: start,
+    operation_start_date: start,
+    operation_end_date: end,
+    schedule_pattern: parseSchedulePattern(input.schedule_pattern),
+    weekday_start: input.weekday_start ?? null,
+    weekday_end: input.weekday_end ?? null,
+    month_day_start: input.month_day_start ?? null,
+    month_day_end: input.month_day_end ?? null,
+    operating_start_time: input.operating_start_time ?? null,
+    operating_end_time: input.operating_end_time ?? null,
+    departure_time: input.departure_time ?? null,
+    arrival_time: input.arrival_time ?? null,
+    transport_mode: input.transport_mode,
+  };
+  assertCompleteZoneSchedule(schedule);
+  return schedule;
+}
+
 export async function createDriverZone(
   input: DriverZoneCreateInput
 ): Promise<DriverZoneResponse> {
@@ -405,6 +490,22 @@ export async function createDriverZone(
     input.arrival_hub
   );
 
+  const sched = scheduleInputForWrite({
+    transport_mode: input.transport_mode,
+    operation_date: input.operation_date,
+    operation_start_date: input.operation_start_date,
+    operation_end_date: input.operation_end_date,
+    schedule_pattern: input.schedule_pattern,
+    weekday_start: input.weekday_start,
+    weekday_end: input.weekday_end,
+    month_day_start: input.month_day_start,
+    month_day_end: input.month_day_end,
+    operating_start_time: input.operating_start_time,
+    operating_end_time: input.operating_end_time,
+    departure_time: input.departure_time,
+    arrival_time: input.arrival_time,
+  });
+
   const result = await pool.query(
     `INSERT INTO driver_zones
        (owner_user_id, driver_name, zone_name, resolution, h3_cells, transport_modes, transport_mode,
@@ -412,13 +513,17 @@ export async function createDriverZone(
         departure_hub_name, departure_hub_lat, departure_hub_lng,
         arrival_hub_name, arrival_hub_lat, arrival_hub_lng,
         departure_time, arrival_time,
+        operation_date, operation_start_date, operation_end_date,
+        schedule_pattern, weekday_start, weekday_end, month_day_start, month_day_end,
+        operating_start_time, operating_end_time,
         base_fee, cost_per_h3_cell, cost_per_km, cost_per_hour, cost_per_kg,
         cost_per_volume_unit, time_of_day_factor, minimum_fee,
         currency, available, trust_payment_forwarder)
      VALUES ($1, $2, $3, $4, $5::jsonb, ARRAY[$6]::TEXT[], $6, $7::jsonb,
              $8, $9, $10, $11, $12, $13, $14, $15,
-             $16, $17, $18, $19, $20, $21, $22, $23,
-             $24, $25, $26)
+             $16, $17, $18, $19, $20, $21, $22, $23, $24, $25,
+             $26, $27, $28, $29, $30, $31, $32, $33,
+             $34, $35, $36)
      RETURNING id`,
     [
       input.owner_user_id,
@@ -434,8 +539,18 @@ export async function createDriverZone(
       input.arrival_hub?.name ?? null,
       input.arrival_hub?.lat ?? null,
       input.arrival_hub?.lng ?? null,
-      input.departure_time ?? null,
-      input.arrival_time ?? null,
+      sched.departure_time,
+      sched.arrival_time,
+      sched.operation_date,
+      sched.operation_start_date,
+      sched.operation_end_date,
+      sched.schedule_pattern,
+      sched.weekday_start,
+      sched.weekday_end,
+      sched.month_day_start,
+      sched.month_day_end,
+      sched.operating_start_time,
+      sched.operating_end_time,
       input.base_fee ?? null,
       input.cost_per_h3_cell ?? null,
       input.cost_per_km ?? null,
@@ -487,6 +602,16 @@ export async function createDriverZoneFromRequest(
     arrival_hub: data.arrival_hub ?? null,
     departure_time: data.departure_time ?? null,
     arrival_time: data.arrival_time ?? null,
+    operation_date: data.operation_date ?? null,
+    operation_start_date: data.operation_start_date ?? data.operation_date ?? null,
+    operation_end_date: data.operation_end_date ?? data.operation_date ?? null,
+    schedule_pattern: data.schedule_pattern ?? "daily",
+    weekday_start: data.weekday_start ?? null,
+    weekday_end: data.weekday_end ?? null,
+    month_day_start: data.month_day_start ?? null,
+    month_day_end: data.month_day_end ?? null,
+    operating_start_time: data.operating_start_time ?? null,
+    operating_end_time: data.operating_end_time ?? null,
     base_fee: data.base_fee ?? null,
     cost_per_h3_cell: data.cost_per_h3_cell ?? null,
     cost_per_km: data.cost_per_km ?? null,
@@ -539,6 +664,50 @@ export async function updateDriverZone(
     input.departure_time !== undefined ? input.departure_time : existing.departure_time;
   const arrival_time =
     input.arrival_time !== undefined ? input.arrival_time : existing.arrival_time;
+  const operation_date =
+    input.operation_date !== undefined ? input.operation_date : existing.operation_date;
+  const operation_start_date =
+    input.operation_start_date !== undefined
+      ? input.operation_start_date
+      : existing.operation_start_date ?? existing.operation_date;
+  const operation_end_date =
+    input.operation_end_date !== undefined
+      ? input.operation_end_date
+      : existing.operation_end_date ?? existing.operation_date;
+  const schedule_pattern =
+    input.schedule_pattern !== undefined ? input.schedule_pattern : existing.schedule_pattern;
+  const weekday_start =
+    input.weekday_start !== undefined ? input.weekday_start : existing.weekday_start;
+  const weekday_end =
+    input.weekday_end !== undefined ? input.weekday_end : existing.weekday_end;
+  const month_day_start =
+    input.month_day_start !== undefined ? input.month_day_start : existing.month_day_start;
+  const month_day_end =
+    input.month_day_end !== undefined ? input.month_day_end : existing.month_day_end;
+  const operating_start_time =
+    input.operating_start_time !== undefined
+      ? input.operating_start_time
+      : existing.operating_start_time;
+  const operating_end_time =
+    input.operating_end_time !== undefined
+      ? input.operating_end_time
+      : existing.operating_end_time;
+
+  const sched = scheduleInputForWrite({
+    transport_mode,
+    operation_date,
+    operation_start_date,
+    operation_end_date,
+    schedule_pattern,
+    weekday_start,
+    weekday_end,
+    month_day_start,
+    month_day_end,
+    operating_start_time,
+    operating_end_time,
+    departure_time,
+    arrival_time,
+  });
 
   let h3_cells = input.h3_cells ?? existing.h3_cells;
   let boundary: LatLngPoint[] | null =
@@ -612,8 +781,18 @@ export async function updateDriverZone(
     arrival_hub?.name ?? null,
     arrival_hub?.lat ?? null,
     arrival_hub?.lng ?? null,
-    departure_time,
-    arrival_time,
+    sched.departure_time,
+    sched.arrival_time,
+    sched.operation_date,
+    sched.operation_start_date,
+    sched.operation_end_date,
+    sched.schedule_pattern,
+    sched.weekday_start,
+    sched.weekday_end,
+    sched.month_day_start,
+    sched.month_day_end,
+    sched.operating_start_time,
+    sched.operating_end_time,
     base_fee,
     cost_per_h3_cell,
     cost_per_km,
@@ -656,10 +835,14 @@ export async function updateDriverZone(
            departure_hub_name = $6, departure_hub_lat = $7, departure_hub_lng = $8,
            arrival_hub_name = $9, arrival_hub_lat = $10, arrival_hub_lng = $11,
            departure_time = $12, arrival_time = $13,
-           base_fee = $14, cost_per_h3_cell = $15, cost_per_km = $16,
-           cost_per_hour = $17, cost_per_kg = $18, cost_per_volume_unit = $19,
-           time_of_day_factor = $20, minimum_fee = $21,
-           currency = $22, available = $23, trust_payment_forwarder = $24,
+           operation_date = $14, operation_start_date = $15, operation_end_date = $16,
+           schedule_pattern = $17, weekday_start = $18, weekday_end = $19,
+           month_day_start = $20, month_day_end = $21,
+           operating_start_time = $22, operating_end_time = $23,
+           base_fee = $24, cost_per_h3_cell = $25, cost_per_km = $26,
+           cost_per_hour = $27, cost_per_kg = $28, cost_per_volume_unit = $29,
+           time_of_day_factor = $30, minimum_fee = $31,
+           currency = $32, available = $33, trust_payment_forwarder = $34,
            updated_at = NOW()${cellsSql}
      WHERE id = $${idParamIdx}${ownerClause}
      RETURNING id`,
@@ -686,6 +869,10 @@ export async function updateDriverZone(
   // changed — that second SELECT was adding several seconds to every
   // metadata edit on large geofence zones.
   if (!cellsChanged) {
+    const scheduleFields = buildZoneScheduleFields({
+      ...sched,
+      transport_mode,
+    });
     return {
       ...existing,
       driver_name,
@@ -694,8 +881,18 @@ export async function updateDriverZone(
       transport_mode,
       departure_hub,
       arrival_hub,
-      departure_time,
-      arrival_time,
+      departure_time: sched.departure_time,
+      arrival_time: sched.arrival_time,
+      operation_date: sched.operation_date,
+      operation_start_date: sched.operation_start_date,
+      operation_end_date: sched.operation_end_date,
+      schedule_pattern: sched.schedule_pattern,
+      weekday_start: sched.weekday_start,
+      weekday_end: sched.weekday_end,
+      month_day_start: sched.month_day_start,
+      month_day_end: sched.month_day_end,
+      operating_start_time: sched.operating_start_time,
+      operating_end_time: sched.operating_end_time,
       base_fee,
       cost_per_h3_cell,
       cost_per_km,
@@ -708,6 +905,7 @@ export async function updateDriverZone(
       available,
       trust_payment_forwarder,
       boundary,
+      schedule_active: isZoneScheduleActive(scheduleFields),
       updated_at: new Date().toISOString(),
     };
   }
@@ -731,6 +929,16 @@ export async function updateDriverZoneFromRequest(
     arrival_hub: data.arrival_hub,
     departure_time: data.departure_time,
     arrival_time: data.arrival_time,
+    operation_date: data.operation_date,
+    operation_start_date: data.operation_start_date,
+    operation_end_date: data.operation_end_date,
+    schedule_pattern: data.schedule_pattern,
+    weekday_start: data.weekday_start,
+    weekday_end: data.weekday_end,
+    month_day_start: data.month_day_start,
+    month_day_end: data.month_day_end,
+    operating_start_time: data.operating_start_time,
+    operating_end_time: data.operating_end_time,
     base_fee: data.base_fee,
     cost_per_h3_cell: data.cost_per_h3_cell,
     cost_per_km: data.cost_per_km,

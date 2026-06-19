@@ -2,6 +2,8 @@ export type SegmentCostStatus = "calculated" | "manual" | "missing" | "requested
 export type SegmentCostSource = "calculated" | "manual" | "external";
 export type RouteCostStatus = "complete" | "partial" | "missing";
 
+import type { OrderPackageEntry } from "./package.model";
+
 export interface OrderRouteRow {
   id: number;
   order_id: number;
@@ -125,6 +127,7 @@ export interface OrderRouteCostComparisonResponse {
   currency: string;
   booking_fee_rate: number;
   package_type: string | null;
+  packages: OrderPackageEntry[];
   package_factor: number | null;
   package_weight_lbs: number | null;
   package_dimensions_in: string | null;

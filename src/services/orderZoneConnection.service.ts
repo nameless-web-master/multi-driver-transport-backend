@@ -5,6 +5,11 @@ import type {
   ConnectionType,
   HubRole,
 } from "../models/zoneConnection.model";
+import {
+  buildZoneScheduleFields,
+  isZoneScheduleActive,
+  parseScheduleFromRow,
+} from "./zoneSchedule.service";
 
 /**
  * Milestone 2 — Order draft preview.
@@ -117,6 +122,16 @@ export interface OrderDraftZoneSummary {
   arrival_hub: OrderDraftHub | null;
   departure_time: string | null;
   arrival_time: string | null;
+  operation_date: string | null;
+  operation_start_date: string | null;
+  operation_end_date: string | null;
+  schedule_pattern: string;
+  weekday_start: number | null;
+  weekday_end: number | null;
+  month_day_start: number | null;
+  month_day_end: number | null;
+  operating_start_time: string | null;
+  operating_end_time: string | null;
 }
 
 export interface OrderDraftHub {
@@ -229,6 +244,16 @@ interface ZoneMeta {
   arrival_hub: OrderDraftHub | null;
   departure_time: string | null;
   arrival_time: string | null;
+  operation_date: string | null;
+  operation_start_date: string | null;
+  operation_end_date: string | null;
+  schedule_pattern: string;
+  weekday_start: number | null;
+  weekday_end: number | null;
+  month_day_start: number | null;
+  month_day_end: number | null;
+  operating_start_time: string | null;
+  operating_end_time: string | null;
 }
 
 interface ConnectionRow {
@@ -299,24 +324,63 @@ async function loadZoneMeta(): Promise<ZoneMeta[]> {
             z.departure_hub_name, z.departure_hub_lat, z.departure_hub_lng,
             z.arrival_hub_name, z.arrival_hub_lat, z.arrival_hub_lng,
             z.departure_time, z.arrival_time,
+            z.operation_date, z.operation_start_date, z.operation_end_date,
+            z.schedule_pattern, z.weekday_start, z.weekday_end,
+            z.month_day_start, z.month_day_end,
+            z.operating_start_time, z.operating_end_time,
             u.full_name AS transport_name
      FROM driver_zones z
      JOIN users u ON u.id = z.owner_user_id
      WHERE z.available = TRUE`
   );
-  return result.rows.map((row) => ({
-    id: Number(row.id),
-    zone_name: String(row.zone_name ?? ""),
-    owner_user_id: Number(row.owner_user_id),
-    transport_name: String(row.transport_name ?? ""),
-    transport_mode: row.transport_mode == null ? null : String(row.transport_mode),
-    resolution: Number(row.resolution ?? 0),
-    cell_count: Number(row.cell_count ?? 0),
-    departure_hub: parseOrderHub(row, "departure_hub"),
-    arrival_hub: parseOrderHub(row, "arrival_hub"),
-    departure_time: row.departure_time == null ? null : String(row.departure_time),
-    arrival_time: row.arrival_time == null ? null : String(row.arrival_time),
-  }));
+  const now = new Date();
+  return result.rows
+    .map((row) => {
+      const schedule = parseScheduleFromRow(row);
+      return {
+        id: Number(row.id),
+        zone_name: String(row.zone_name ?? ""),
+        owner_user_id: Number(row.owner_user_id),
+        transport_name: String(row.transport_name ?? ""),
+        transport_mode: row.transport_mode == null ? null : String(row.transport_mode),
+        resolution: Number(row.resolution ?? 0),
+        cell_count: Number(row.cell_count ?? 0),
+        departure_hub: parseOrderHub(row, "departure_hub"),
+        arrival_hub: parseOrderHub(row, "arrival_hub"),
+        departure_time: schedule.departure_time,
+        arrival_time: schedule.arrival_time,
+        operation_date: schedule.operation_date,
+        operation_start_date: schedule.operation_start_date,
+        operation_end_date: schedule.operation_end_date,
+        schedule_pattern: schedule.schedule_pattern,
+        weekday_start: schedule.weekday_start,
+        weekday_end: schedule.weekday_end,
+        month_day_start: schedule.month_day_start,
+        month_day_end: schedule.month_day_end,
+        operating_start_time: schedule.operating_start_time,
+        operating_end_time: schedule.operating_end_time,
+      };
+    })
+    .filter((z) =>
+      isZoneScheduleActive(
+        buildZoneScheduleFields({
+          transport_mode: z.transport_mode ?? "land",
+          operation_date: z.operation_date,
+          operation_start_date: z.operation_start_date,
+          operation_end_date: z.operation_end_date,
+          schedule_pattern: z.schedule_pattern,
+          weekday_start: z.weekday_start,
+          weekday_end: z.weekday_end,
+          month_day_start: z.month_day_start,
+          month_day_end: z.month_day_end,
+          operating_start_time: z.operating_start_time,
+          operating_end_time: z.operating_end_time,
+          departure_time: z.departure_time,
+          arrival_time: z.arrival_time,
+        }),
+        now
+      )
+    );
 }
 
 /**
@@ -878,6 +942,16 @@ function zoneMetaToSummary(
     arrival_hub: z.arrival_hub,
     departure_time: z.departure_time,
     arrival_time: z.arrival_time,
+    operation_date: z.operation_date,
+    operation_start_date: z.operation_start_date,
+    operation_end_date: z.operation_end_date,
+    schedule_pattern: z.schedule_pattern,
+    weekday_start: z.weekday_start,
+    weekday_end: z.weekday_end,
+    month_day_start: z.month_day_start,
+    month_day_end: z.month_day_end,
+    operating_start_time: z.operating_start_time,
+    operating_end_time: z.operating_end_time,
   };
 }
 
@@ -912,12 +986,16 @@ export async function previewOrderZoneConnectionsByCoordinates(
   // Run zone-meta load, connection load, and the two SQL covering checks in
   // parallel — none of them depend on each other and each is a single
   // round-trip, so wall-time should be dominated by the slowest.
-  const [zones, allConnections, pickupIds, destIds] = await Promise.all([
+  const [zones, allConnections, pickupIdsRaw, destIdsRaw] = await Promise.all([
     loadZoneMeta(),
     loadConnections(),
     findCoveringZoneIdsSql(input.source_lat, input.source_lng),
     findCoveringZoneIdsSql(input.destination_lat, input.destination_lng),
   ]);
+
+  const activeZoneIds = new Set(zones.map((z) => z.id));
+  const pickupIds = new Set([...pickupIdsRaw].filter((id) => activeZoneIds.has(id)));
+  const destIds = new Set([...destIdsRaw].filter((id) => activeZoneIds.has(id)));
 
   // Only walk through zones we actually loaded (i.e. `available = TRUE`).
   // Stale connection rows pointing at unavailable zones must not let BFS

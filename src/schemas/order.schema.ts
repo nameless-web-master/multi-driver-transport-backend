@@ -1,8 +1,42 @@
 import { z } from "zod";
 import { latitudeSchema, longitudeSchema } from "./h3.schema";
-import { PACKAGE_TYPES, packageFactorForType } from "../models/package.model";
+import {
+  MAX_PACKAGES,
+  PACKAGE_TYPES,
+  normalizeOrderPackages,
+} from "../models/package.model";
 
 export const packageTypeSchema = z.enum(PACKAGE_TYPES);
+
+const positivePackageNumber = (label: string) =>
+  z
+    .number({ invalid_type_error: `${label} must be a number` })
+    .positive(`${label} must be greater than 0`)
+    .max(1_000_000);
+
+export const orderPackageEntrySchema = z.object({
+  package_type: packageTypeSchema,
+  weight_lbs: positivePackageNumber("weight_lbs"),
+  package_length: positivePackageNumber("package_length"),
+  package_width: positivePackageNumber("package_width"),
+  package_height: positivePackageNumber("package_height"),
+});
+
+function resolvePackagesInput(data: {
+  packages?: z.infer<typeof orderPackageEntrySchema>[];
+  package_type?: z.infer<typeof packageTypeSchema>;
+  weight_lbs?: number | null;
+  package_length?: number | null;
+  package_width?: number | null;
+  package_height?: number | null;
+}) {
+  return normalizeOrderPackages(data.packages, data.package_type ?? null, {
+    weight_lbs: data.weight_lbs,
+    package_length: data.package_length,
+    package_width: data.package_width,
+    package_height: data.package_height,
+  });
+}
 
 export const createOrderSchema = z.object({
   receiver_user_id: z.number().int().positive(),
@@ -11,41 +45,48 @@ export const createOrderSchema = z.object({
   sender_lng: longitudeSchema.optional().nullable(),
   notes: z.string().trim().max(1000).optional().default(""),
   driver_user_id: z.number().int().positive().optional().nullable(),
-  // ---- Milestone 1 (updated scope): basic order form fields. ----
   source_name: z.string().trim().max(200).optional().default(""),
   source_contact: z.string().trim().max(120).optional().default(""),
   payment_method: z.string().trim().max(60).optional().default(""),
   shipping_method: z.string().trim().max(60).optional().default(""),
   package_description: z.string().trim().max(1000).optional().default(""),
-  package_type: packageTypeSchema,
-  weight_lbs: z
-    .number({ invalid_type_error: "weight_lbs must be a number" })
-    .positive("Weight must be greater than 0")
-    .max(1_000_000)
-    .optional()
-    .nullable(),
+  /** @deprecated Use `packages` — kept for single-package clients. */
+  package_type: packageTypeSchema.optional(),
+  packages: z.array(orderPackageEntrySchema).min(1).max(MAX_PACKAGES).optional(),
+  /** @deprecated Applied to a single package when `packages` is omitted. */
+  weight_lbs: positivePackageNumber("weight_lbs").optional().nullable(),
   package_weight_unit: z.literal("lb").optional().default("lb"),
-  package_length: z
-    .number({ invalid_type_error: "package_length must be a number" })
-    .positive("Length must be greater than 0")
-    .max(1_000_000)
-    .optional()
-    .nullable(),
-  package_width: z
-    .number({ invalid_type_error: "package_width must be a number" })
-    .positive("Width must be greater than 0")
-    .max(1_000_000)
-    .optional()
-    .nullable(),
-  package_height: z
-    .number({ invalid_type_error: "package_height must be a number" })
-    .positive("Height must be greater than 0")
-    .max(1_000_000)
-    .optional()
-    .nullable(),
+  package_length: positivePackageNumber("package_length").optional().nullable(),
+  package_width: positivePackageNumber("package_width").optional().nullable(),
+  package_height: positivePackageNumber("package_height").optional().nullable(),
   package_dimension_unit: z.literal("in").optional().default("in"),
-  dimensions: z.string().trim().max(120).optional().default(""),
+  dimensions: z.string().trim().max(500).optional().default(""),
 }).superRefine((data, ctx) => {
+  const packages = resolvePackagesInput(data);
+  if (packages.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["packages"],
+      message: "Provide at least one package with type, weight, and dimensions",
+    });
+    return;
+  }
+
+  if (!data.packages?.length) {
+    const missing =
+      data.weight_lbs == null ||
+      data.package_length == null ||
+      data.package_width == null ||
+      data.package_height == null;
+    if (missing && !data.package_type) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["packages"],
+        message: "Provide packages array or package_type with weight and dimensions",
+      });
+    }
+  }
+
   if (data.package_weight_unit && data.package_weight_unit !== "lb") {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -60,14 +101,6 @@ export const createOrderSchema = z.object({
       message: "Dimension unit must be in (inches)",
     });
   }
-  const weight = data.weight_lbs;
-  if (weight == null) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ["weight_lbs"],
-      message: "Weight (lbs) is required",
-    });
-  }
 });
 
 export const updateOrderStatusSchema = z.object({
@@ -77,36 +110,18 @@ export const updateOrderStatusSchema = z.object({
 export const updateOrderPackageSchema = z
   .object({
     package_type: packageTypeSchema.optional(),
-    weight_lbs: z
-      .number({ invalid_type_error: "weight_lbs must be a number" })
-      .positive("Weight must be greater than 0")
-      .max(1_000_000)
-      .optional()
-      .nullable(),
-    package_length: z
-      .number({ invalid_type_error: "package_length must be a number" })
-      .positive("Length must be greater than 0")
-      .max(1_000_000)
-      .optional()
-      .nullable(),
-    package_width: z
-      .number({ invalid_type_error: "package_width must be a number" })
-      .positive("Width must be greater than 0")
-      .max(1_000_000)
-      .optional()
-      .nullable(),
-    package_height: z
-      .number({ invalid_type_error: "package_height must be a number" })
-      .positive("Height must be greater than 0")
-      .max(1_000_000)
-      .optional()
-      .nullable(),
+    packages: z.array(orderPackageEntrySchema).min(1).max(MAX_PACKAGES).optional(),
+    weight_lbs: positivePackageNumber("weight_lbs").optional().nullable(),
+    package_length: positivePackageNumber("package_length").optional().nullable(),
+    package_width: positivePackageNumber("package_width").optional().nullable(),
+    package_height: positivePackageNumber("package_height").optional().nullable(),
     package_description: z.string().trim().max(1000).optional(),
-    dimensions: z.string().trim().max(120).optional(),
+    dimensions: z.string().trim().max(500).optional(),
   })
   .superRefine((data, ctx) => {
     const hasField =
       data.package_type != null ||
+      (data.packages != null && data.packages.length > 0) ||
       data.weight_lbs !== undefined ||
       data.package_length !== undefined ||
       data.package_width !== undefined ||

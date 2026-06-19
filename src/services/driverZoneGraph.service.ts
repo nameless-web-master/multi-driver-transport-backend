@@ -15,6 +15,7 @@ import type {
 } from "../models/zoneConnection.model";
 import type { UserRole } from "../models/userRole.model";
 import { recalculateAllZoneConnections } from "./zoneConnection.service";
+import { buildZoneScheduleFields, isZoneScheduleActive, parseScheduleFromRow } from "./zoneSchedule.service";
 
 /**
  * Milestone 3 — Driver-Zone Graph service.
@@ -74,6 +75,9 @@ interface ZoneRow {
   arrival_hub_lng: number | null;
   departure_time: string | null;
   arrival_time: string | null;
+  operation_date: string | Date | null;
+  operating_start_time: string | null;
+  operating_end_time: string | null;
 }
 
 interface ConnectionRow {
@@ -437,6 +441,10 @@ const ZONE_SELECT = `
          z.departure_hub_name, z.departure_hub_lat, z.departure_hub_lng,
          z.arrival_hub_name, z.arrival_hub_lat, z.arrival_hub_lng,
          z.departure_time, z.arrival_time,
+         z.operation_date, z.operation_start_date, z.operation_end_date,
+         z.schedule_pattern, z.weekday_start, z.weekday_end,
+         z.month_day_start, z.month_day_end,
+         z.operating_start_time, z.operating_end_time,
          COALESCE(u.full_name, '') AS transport_name
   FROM driver_zones z
   LEFT JOIN users u ON u.id = z.owner_user_id
@@ -461,6 +469,16 @@ const CONNECTION_SELECT = `
  */
 type Queryable = Pick<typeof pool, "query">;
 
+function isScheduleActiveRow(row: ZoneRow): boolean {
+  const schedule = parseScheduleFromRow(row as unknown as Record<string, unknown>);
+  return isZoneScheduleActive(
+    buildZoneScheduleFields({
+      transport_mode: String(row.transport_mode ?? "land"),
+      ...schedule,
+    })
+  );
+}
+
 async function fetchZonesForScope(
   ctx: GraphAccess,
   db: Queryable = pool
@@ -469,7 +487,7 @@ async function fetchZonesForScope(
   // of theirs. Privileged roles see everything.
   if (isPrivilegedRole(ctx.role)) {
     const result = await db.query(`${ZONE_SELECT} ORDER BY z.id`);
-    return result.rows as ZoneRow[];
+    return (result.rows as ZoneRow[]).filter(isScheduleActiveRow);
   }
   if (ctx.role === "driver") {
     const result = await db.query(
@@ -487,7 +505,7 @@ async function fetchZonesForScope(
        ORDER BY z.id`,
       [ctx.userId]
     );
-    return result.rows as ZoneRow[];
+    return (result.rows as ZoneRow[]).filter(isScheduleActiveRow);
   }
   // Fallback (unknown roles): no data.
   return [];

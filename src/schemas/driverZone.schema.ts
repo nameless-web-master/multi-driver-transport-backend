@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { CURRENCIES, DEFAULT_CURRENCY } from "../models/currency.model";
 import { TRANSPORT_MODES } from "../models/transportMode.model";
+import { SCHEDULE_PATTERNS } from "../models/zoneSchedule.model";
 import { resolutionSchema } from "./h3.schema";
 import { latLngPointSchema } from "./h3Polygon.schema";
 
@@ -36,6 +37,90 @@ const scheduleTimeSchema = z
   .optional()
   .nullable();
 
+/** Required HH:MM schedule time. */
+const requiredScheduleTimeSchema = z
+  .string()
+  .trim()
+  .regex(/^([01]\d|2[0-3]):[0-5]\d$/, "time must be HH:MM (24-hour)");
+
+const operationDateSchema = z
+  .string()
+  .trim()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, "date must be YYYY-MM-DD");
+
+const schedulePatternSchema = z.preprocess(
+  (val) => (typeof val === "string" ? val.trim().toLowerCase() : val ?? "daily"),
+  z.enum(SCHEDULE_PATTERNS)
+);
+
+const weekdaySchema = z.coerce.number().int().min(0).max(6).optional().nullable();
+const monthDaySchema = z.coerce.number().int().min(1).max(31).optional().nullable();
+
+function refineScheduleFields(
+  data: {
+    operation_date?: string;
+    operation_start_date?: string;
+    operation_end_date?: string;
+    schedule_pattern?: string;
+    weekday_start?: number | null;
+    weekday_end?: number | null;
+    month_day_start?: number | null;
+    month_day_end?: number | null;
+  },
+  ctx: z.RefinementCtx
+): void {
+  const start = data.operation_start_date ?? data.operation_date;
+  const end = data.operation_end_date ?? data.operation_date ?? start;
+  if (!start || !end) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["operation_start_date"],
+      message: "operation_start_date and operation_end_date are required",
+    });
+    return;
+  }
+  if (start > end) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["operation_end_date"],
+      message: "operation_end_date must be on or after operation_start_date",
+    });
+  }
+  const pattern = String(data.schedule_pattern ?? "daily");
+  if (pattern === "weekly") {
+    if (data.weekday_start == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["weekday_start"],
+        message: "weekday_start is required for weekly schedules",
+      });
+    }
+    if (data.weekday_end == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["weekday_end"],
+        message: "weekday_end is required for weekly schedules",
+      });
+    }
+  }
+  if (pattern === "monthly") {
+    if (data.month_day_start == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["month_day_start"],
+        message: "month_day_start is required for monthly schedules",
+      });
+    }
+    if (data.month_day_end == null) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["month_day_end"],
+        message: "month_day_end is required for monthly schedules",
+      });
+    }
+  }
+}
+
 /** Optional, non-negative pricing field. Coerces "" / null to undefined. */
 const rateFieldSchema = z.preprocess(
   (val) => (val === "" || val === null ? undefined : val),
@@ -57,6 +142,16 @@ const zoneBaseFields = {
   arrival_hub: hubTerminalSchema.optional().nullable(),
   departure_time: scheduleTimeSchema,
   arrival_time: scheduleTimeSchema,
+  operation_date: operationDateSchema.optional(),
+  operation_start_date: operationDateSchema,
+  operation_end_date: operationDateSchema,
+  schedule_pattern: schedulePatternSchema.optional().default("daily"),
+  weekday_start: weekdaySchema,
+  weekday_end: weekdaySchema,
+  month_day_start: monthDaySchema,
+  month_day_end: monthDaySchema,
+  operating_start_time: scheduleTimeSchema,
+  operating_end_time: scheduleTimeSchema,
   // Pricing engine — base cost, travel rate (per km), wage (per hour).
   base_fee: rateFieldSchema,
   cost_per_km: rateFieldSchema,
@@ -94,6 +189,7 @@ export const createDriverZoneSchema = z
     h3_cells: z.array(z.string()).optional(),
   })
   .superRefine((data, ctx) => {
+    refineScheduleFields(data, ctx);
     if (isHubRoutePayload(data)) {
       if (!data.departure_hub) {
         ctx.addIssue({
@@ -120,7 +216,35 @@ export const createDriverZoneSchema = z
           message: "transport_mode must be air or sea when departure and arrival hubs are set",
         });
       }
+      if (!data.departure_time) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["departure_time"],
+          message: "departure_time is required for air/sea routes",
+        });
+      }
+      if (!data.arrival_time) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["arrival_time"],
+          message: "arrival_time is required for air/sea routes",
+        });
+      }
       return;
+    }
+    if (!data.operating_start_time) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["operating_start_time"],
+        message: "operating_start_time is required for land zones",
+      });
+    }
+    if (!data.operating_end_time) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["operating_end_time"],
+        message: "operating_end_time is required for land zones",
+      });
     }
     const hasCells = (data.h3_cells?.length ?? 0) > 0;
     const hasBoundary = (data.boundary?.length ?? 0) >= 3;
@@ -145,6 +269,16 @@ export const updateDriverZoneSchema = z
     arrival_hub: hubTerminalSchema.optional().nullable(),
     departure_time: scheduleTimeSchema,
     arrival_time: scheduleTimeSchema,
+    operation_date: operationDateSchema.optional(),
+    operation_start_date: operationDateSchema.optional(),
+    operation_end_date: operationDateSchema.optional(),
+    schedule_pattern: schedulePatternSchema.optional(),
+    weekday_start: weekdaySchema,
+    weekday_end: weekdaySchema,
+    month_day_start: monthDaySchema,
+    month_day_end: monthDaySchema,
+    operating_start_time: scheduleTimeSchema,
+    operating_end_time: scheduleTimeSchema,
     base_fee: rateFieldSchema,
     cost_per_km: rateFieldSchema,
     cost_per_hour: rateFieldSchema,
@@ -159,6 +293,20 @@ export const updateDriverZoneSchema = z
   })
   .refine((data) => Object.keys(data).length > 0, {
     message: "at least one field must be provided for update",
+  })
+  .superRefine((data, ctx) => {
+    if (
+      data.operation_start_date !== undefined ||
+      data.operation_end_date !== undefined ||
+      data.operation_date !== undefined ||
+      data.schedule_pattern !== undefined ||
+      data.weekday_start !== undefined ||
+      data.weekday_end !== undefined ||
+      data.month_day_start !== undefined ||
+      data.month_day_end !== undefined
+    ) {
+      refineScheduleFields(data, ctx);
+    }
   });
 
 export type CreateDriverZoneRequest = z.infer<typeof createDriverZoneSchema>;
@@ -185,6 +333,16 @@ export interface DriverZoneResponse {
   arrival_hub: HubTerminal | null;
   departure_time: string | null;
   arrival_time: string | null;
+  operation_date: string | null;
+  operation_start_date: string | null;
+  operation_end_date: string | null;
+  schedule_pattern: string;
+  weekday_start: number | null;
+  weekday_end: number | null;
+  month_day_start: number | null;
+  month_day_end: number | null;
+  operating_start_time: string | null;
+  operating_end_time: string | null;
   base_fee: number | null;
   cost_per_km: number | null;
   cost_per_hour: number | null;
@@ -197,6 +355,8 @@ export interface DriverZoneResponse {
   available: boolean;
   trust_payment_forwarder: boolean;
   driver_trustworthiness?: number;
+  /** True when the zone schedule is complete and the current time is within the window. */
+  schedule_active?: boolean;
   created_at: string;
   updated_at: string;
 }

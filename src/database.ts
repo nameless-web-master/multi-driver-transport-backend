@@ -213,6 +213,32 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS arrival_hub_lng DOUBLE PRECISION;`);
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS departure_time TEXT;`);
     await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS arrival_time TEXT;`);
+    // Per-zone operation schedule — date + daily hours (land) or flight times (air/sea).
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS operation_date DATE;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS operating_start_time TEXT;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS operating_end_time TEXT;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS operation_start_date DATE;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS operation_end_date DATE;`);
+    await client.query(
+      `ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS schedule_pattern TEXT NOT NULL DEFAULT 'daily';`
+    );
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS weekday_start SMALLINT;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS weekday_end SMALLINT;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS month_day_start SMALLINT;`);
+    await client.query(`ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS month_day_end SMALLINT;`);
+    await client.query(
+      `UPDATE driver_zones
+         SET operation_start_date = COALESCE(operation_start_date, operation_date),
+             operation_end_date = COALESCE(operation_end_date, operation_date)
+       WHERE operation_date IS NOT NULL
+         AND (operation_start_date IS NULL OR operation_end_date IS NULL);`
+    );
+    await client.query(`ALTER TABLE driver_zones DROP CONSTRAINT IF EXISTS driver_zones_schedule_pattern_check;`);
+    await client.query(
+      `ALTER TABLE driver_zones
+         ADD CONSTRAINT driver_zones_schedule_pattern_check
+         CHECK (schedule_pattern IN ('daily', 'weekly', 'monthly'));`
+    );
 
     await client.query(`CREATE INDEX IF NOT EXISTS idx_driver_zones_owner_user_id ON driver_zones (owner_user_id);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_driver_zones_h3_cells ON driver_zones USING GIN (h3_cells);`);
@@ -309,6 +335,7 @@ export async function ensureSchema(): Promise<void> {
     // Pricing engine — package classification + enforced unit defaults.
     await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_type TEXT;`);
     await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS package_factor NUMERIC(10, 6);`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS packages JSONB;`);
     await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS weight_lbs NUMERIC(12, 3);`);
     // Backfill canonical lbs column from legacy weight_kg (values were already migrated to lb).
     await client.query(
@@ -326,6 +353,46 @@ export async function ensureSchema(): Promise<void> {
     await client.query(
       `UPDATE orders SET package_type = 'medium', package_factor = 0.05
        WHERE package_type IS NULL;`
+    );
+    await client.query(
+      `UPDATE orders
+         SET packages = jsonb_build_array(
+           jsonb_build_object(
+             'package_type', package_type,
+             'weight_lbs', COALESCE(weight_lbs, 1),
+             'package_length', COALESCE(package_length, 1),
+             'package_width', COALESCE(package_width, 1),
+             'package_height', COALESCE(package_height, 1)
+           )
+         )
+       WHERE packages IS NULL AND package_type IS NOT NULL;`
+    );
+    await client.query(
+      `UPDATE orders
+         SET packages = '[{"package_type":"medium","weight_lbs":1,"package_length":1,"package_width":1,"package_height":1}]'::jsonb
+       WHERE packages IS NULL;`
+    );
+    await client.query(
+      `UPDATE orders o
+         SET packages = (
+           SELECT jsonb_agg(
+             pkg || jsonb_build_object(
+               'weight_lbs', COALESCE((pkg->>'weight_lbs')::numeric, o.weight_lbs, 1),
+               'package_length', COALESCE((pkg->>'package_length')::numeric, o.package_length, 1),
+               'package_width', COALESCE((pkg->>'package_width')::numeric, o.package_width, 1),
+               'package_height', COALESCE((pkg->>'package_height')::numeric, o.package_height, 1)
+             )
+           )
+           FROM jsonb_array_elements(o.packages) AS pkg
+         )
+       WHERE EXISTS (
+         SELECT 1
+         FROM jsonb_array_elements(o.packages) AS pkg
+         WHERE pkg->>'weight_lbs' IS NULL
+            OR pkg->>'package_length' IS NULL
+            OR pkg->>'package_width' IS NULL
+            OR pkg->>'package_height' IS NULL
+       );`
     );
     await client.query(
       `UPDATE orders SET package_weight_unit = 'lb' WHERE package_weight_unit IS NULL OR package_weight_unit = 'kg';`
