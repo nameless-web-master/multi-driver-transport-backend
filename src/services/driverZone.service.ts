@@ -27,6 +27,52 @@ import {
   parseScheduleFromRow,
   parseSchedulePattern,
 } from "./zoneSchedule.service";
+import {
+  mergeZoneRateWithRegion,
+  rateDefaultsConfigured,
+  loadRegionsByIds,
+} from "./pricingRegion.service";
+import type { RegionRateDefaults, ZonePricingMode } from "../models/pricingRegion.model";
+
+function assertSystemPricingConfigured(input: {
+  pricing_mode: ZonePricingMode;
+  pricing_region_id: number | null;
+  base_fee: number | null;
+  cost_per_km: number | null;
+  cost_per_hour: number | null;
+  region_rates?: RegionRateDefaults | null;
+}): void {
+  if (input.pricing_mode !== "system") return;
+  const merged = mergeZoneRateWithRegion(
+    {
+      base_fee: input.base_fee,
+      cost_per_km: input.cost_per_km,
+      cost_per_hour: input.cost_per_hour,
+      currency: "CAD",
+    },
+    input.region_rates
+  );
+  if (!rateDefaultsConfigured(merged)) {
+    throw new Error(
+      "System pricing requires a pricing region with rates or at least one zone rate (base, cost per km, or cost per hour)"
+    );
+  }
+}
+
+async function validateSystemPricing(input: {
+  pricing_mode: ZonePricingMode;
+  pricing_region_id: number | null;
+  base_fee: number | null;
+  cost_per_km: number | null;
+  cost_per_hour: number | null;
+}): Promise<void> {
+  let region_rates: RegionRateDefaults | null = null;
+  if (input.pricing_region_id != null) {
+    const regions = await loadRegionsByIds([input.pricing_region_id]);
+    region_rates = regions.get(input.pricing_region_id) ?? null;
+  }
+  assertSystemPricingConfigured({ ...input, region_rates });
+}
 
 const ZONE_SELECT = `
   SELECT z.id, z.owner_user_id, z.driver_name, z.zone_name, z.resolution, z.h3_cells,
@@ -40,11 +86,16 @@ const ZONE_SELECT = `
          z.operating_start_time, z.operating_end_time,
          z.base_fee, z.cost_per_h3_cell, z.cost_per_km, z.cost_per_hour, z.cost_per_kg,
          z.cost_per_volume_unit, z.time_of_day_factor, z.minimum_fee,
-         z.currency, z.available, z.trust_payment_forwarder,
+         z.currency, z.pricing_mode, z.pricing_region_id,
+         pr.name AS pricing_region_name,
+         pr.base_fee AS region_base_fee, pr.cost_per_km AS region_cost_per_km,
+         pr.cost_per_hour AS region_cost_per_hour, pr.currency AS region_currency,
+         z.available, z.trust_payment_forwarder,
          z.created_at, z.updated_at,
          COALESCE(u.trustworthiness, 0) AS driver_trustworthiness
   FROM driver_zones z
   LEFT JOIN users u ON u.id = z.owner_user_id
+  LEFT JOIN pricing_regions pr ON pr.id = z.pricing_region_id
 `;
 
 function isHubTransportMode(mode: string): boolean {
@@ -74,8 +125,35 @@ function parseHubFromRow(
   return { name: nameStr, lat: latN, lng: lngN };
 }
 
+function effectiveRatesFromRow(row: Record<string, unknown>) {
+  const merged = mergeZoneRateWithRegion(
+    {
+      base_fee: toNullableNum(row.base_fee),
+      cost_per_km: toNullableNum(row.cost_per_km),
+      cost_per_hour: toNullableNum(row.cost_per_hour),
+      currency: String(row.currency ?? "CAD"),
+    },
+    row.pricing_region_id == null
+      ? null
+      : {
+          base_fee: toNullableNum(row.region_base_fee),
+          cost_per_km: toNullableNum(row.region_cost_per_km),
+          cost_per_hour: toNullableNum(row.region_cost_per_hour),
+          currency: String(row.region_currency ?? row.currency ?? "CAD"),
+        }
+  );
+  return merged;
+}
+
 function rowToResponse(
-  row: DriverZoneRow & { driver_trustworthiness?: number },
+  row: DriverZoneRow & {
+    driver_trustworthiness?: number;
+    pricing_region_name?: string | null;
+    region_base_fee?: number | null;
+    region_cost_per_km?: number | null;
+    region_cost_per_hour?: number | null;
+    region_currency?: string | null;
+  },
   now: Date = new Date()
 ): DriverZoneResponse {
   const cells = Array.isArray(row.h3_cells) ? row.h3_cells : [];
@@ -84,6 +162,7 @@ function rowToResponse(
     transport_mode: row.transport_mode,
     ...schedule,
   });
+  const effective = effectiveRatesFromRow(row as unknown as Record<string, unknown>);
   return {
     id: row.id,
     owner_user_id: row.owner_user_id,
@@ -117,6 +196,20 @@ function rowToResponse(
     time_of_day_factor: row.time_of_day_factor,
     minimum_fee: row.minimum_fee,
     currency: row.currency,
+    pricing_mode: row.pricing_mode,
+    pricing_region_id: row.pricing_region_id,
+    pricing_region_name: row.pricing_region_name ?? null,
+    region_rates:
+      row.pricing_region_id == null
+        ? null
+        : {
+            base_fee: row.region_base_fee ?? null,
+            cost_per_km: row.region_cost_per_km ?? null,
+            cost_per_hour: row.region_cost_per_hour ?? null,
+          },
+    effective_base_fee: effective.base_fee,
+    effective_cost_per_km: effective.cost_per_km,
+    effective_cost_per_hour: effective.cost_per_hour,
     available: row.available,
     trust_payment_forwarder: row.trust_payment_forwarder,
     driver_trustworthiness: row.driver_trustworthiness ?? 0,
@@ -149,7 +242,16 @@ function parseBoundary(raw: unknown): LatLngPoint[] | null {
   return null;
 }
 
-function parseRow(row: Record<string, unknown>): DriverZoneRow & { driver_trustworthiness?: number } {
+function parseRow(
+  row: Record<string, unknown>
+): DriverZoneRow & {
+  driver_trustworthiness?: number;
+  pricing_region_name?: string | null;
+  region_base_fee?: number | null;
+  region_cost_per_km?: number | null;
+  region_cost_per_hour?: number | null;
+  region_currency?: string | null;
+} {
   const rawCells = row.h3_cells;
   let h3_cells: string[] = [];
   if (Array.isArray(rawCells)) {
@@ -200,11 +302,21 @@ function parseRow(row: Record<string, unknown>): DriverZoneRow & { driver_trustw
     time_of_day_factor: toNullableNum(row.time_of_day_factor),
     minimum_fee: toNullableNum(row.minimum_fee),
     currency: normalizeCurrency(row.currency),
+    pricing_mode: (String(row.pricing_mode ?? "system") === "manual"
+      ? "manual"
+      : "system") as ZonePricingMode,
+    pricing_region_id:
+      row.pricing_region_id == null ? null : Number(row.pricing_region_id),
     available: Boolean(row.available ?? true),
     trust_payment_forwarder: Boolean(row.trust_payment_forwarder ?? false),
     created_at: new Date(String(row.created_at)),
     updated_at: new Date(String(row.updated_at)),
     driver_trustworthiness: Number(row.driver_trustworthiness ?? 0),
+    pricing_region_name: row.pricing_region_name == null ? null : String(row.pricing_region_name),
+    region_base_fee: toNullableNum(row.region_base_fee),
+    region_cost_per_km: toNullableNum(row.region_cost_per_km),
+    region_cost_per_hour: toNullableNum(row.region_cost_per_hour),
+    region_currency: row.region_currency == null ? null : String(row.region_currency),
   };
 }
 
@@ -506,6 +618,14 @@ export async function createDriverZone(
     arrival_time: input.arrival_time,
   });
 
+  await validateSystemPricing({
+    pricing_mode: input.pricing_mode ?? "system",
+    pricing_region_id: input.pricing_region_id ?? null,
+    base_fee: input.base_fee ?? null,
+    cost_per_km: input.cost_per_km ?? null,
+    cost_per_hour: input.cost_per_hour ?? null,
+  });
+
   const result = await pool.query(
     `INSERT INTO driver_zones
        (owner_user_id, driver_name, zone_name, resolution, h3_cells, transport_modes, transport_mode,
@@ -518,12 +638,13 @@ export async function createDriverZone(
         operating_start_time, operating_end_time,
         base_fee, cost_per_h3_cell, cost_per_km, cost_per_hour, cost_per_kg,
         cost_per_volume_unit, time_of_day_factor, minimum_fee,
-        currency, available, trust_payment_forwarder)
+        currency, pricing_mode, pricing_region_id,
+        available, trust_payment_forwarder)
      VALUES ($1, $2, $3, $4, $5::jsonb, ARRAY[$6]::TEXT[], $6, $7::jsonb,
              $8, $9, $10, $11, $12, $13, $14, $15,
              $16, $17, $18, $19, $20, $21, $22, $23, $24, $25,
              $26, $27, $28, $29, $30, $31, $32, $33,
-             $34, $35, $36)
+             $34, $35, $36, $37, $38)
      RETURNING id`,
     [
       input.owner_user_id,
@@ -560,6 +681,8 @@ export async function createDriverZone(
       input.time_of_day_factor ?? null,
       input.minimum_fee ?? null,
       normalizeCurrency(input.currency),
+      input.pricing_mode ?? "system",
+      input.pricing_region_id ?? null,
       input.available,
       input.trust_payment_forwarder,
     ]
@@ -621,6 +744,8 @@ export async function createDriverZoneFromRequest(
     time_of_day_factor: data.time_of_day_factor ?? null,
     minimum_fee: data.minimum_fee ?? null,
     currency: normalizeCurrency(data.currency ?? DEFAULT_CURRENCY),
+    pricing_mode: data.pricing_mode ?? "system",
+    pricing_region_id: data.pricing_region_id ?? null,
     available: data.available,
     trust_payment_forwarder: data.trust_payment_forwarder,
   });
@@ -653,6 +778,12 @@ export async function updateDriverZone(
     input.time_of_day_factor !== undefined ? input.time_of_day_factor : existing.time_of_day_factor;
   const minimum_fee = input.minimum_fee !== undefined ? input.minimum_fee : existing.minimum_fee;
   const currency: Currency = normalizeCurrency(input.currency ?? existing.currency);
+  const pricing_mode =
+    input.pricing_mode !== undefined ? input.pricing_mode : (existing.pricing_mode as ZonePricingMode);
+  const pricing_region_id =
+    input.pricing_region_id !== undefined
+      ? input.pricing_region_id
+      : existing.pricing_region_id;
   const available = input.available ?? existing.available;
   const trust_payment_forwarder =
     input.trust_payment_forwarder ?? existing.trust_payment_forwarder;
@@ -769,6 +900,14 @@ export async function updateDriverZone(
     cellsChanged = false;
   }
 
+  await validateSystemPricing({
+    pricing_mode,
+    pricing_region_id,
+    base_fee,
+    cost_per_km,
+    cost_per_hour,
+  });
+
   const params: unknown[] = [
     driver_name,
     zone_name,
@@ -802,6 +941,8 @@ export async function updateDriverZone(
     time_of_day_factor,
     minimum_fee,
     currency,
+    pricing_mode,
+    pricing_region_id,
     available,
     trust_payment_forwarder,
   ];
@@ -842,7 +983,8 @@ export async function updateDriverZone(
            base_fee = $24, cost_per_h3_cell = $25, cost_per_km = $26,
            cost_per_hour = $27, cost_per_kg = $28, cost_per_volume_unit = $29,
            time_of_day_factor = $30, minimum_fee = $31,
-           currency = $32, available = $33, trust_payment_forwarder = $34,
+           currency = $32, pricing_mode = $33, pricing_region_id = $34,
+           available = $35, trust_payment_forwarder = $36,
            updated_at = NOW()${cellsSql}
      WHERE id = $${idParamIdx}${ownerClause}
      RETURNING id`,
@@ -902,6 +1044,26 @@ export async function updateDriverZone(
       time_of_day_factor,
       minimum_fee,
       currency,
+      pricing_mode,
+      pricing_region_id,
+      effective_base_fee: mergeZoneRateWithRegion(
+        { base_fee, cost_per_km, cost_per_hour, currency },
+        existing.region_rates
+          ? { ...existing.region_rates, currency }
+          : null
+      ).base_fee,
+      effective_cost_per_km: mergeZoneRateWithRegion(
+        { base_fee, cost_per_km, cost_per_hour, currency },
+        existing.region_rates
+          ? { ...existing.region_rates, currency }
+          : null
+      ).cost_per_km,
+      effective_cost_per_hour: mergeZoneRateWithRegion(
+        { base_fee, cost_per_km, cost_per_hour, currency },
+        existing.region_rates
+          ? { ...existing.region_rates, currency }
+          : null
+      ).cost_per_hour,
       available,
       trust_payment_forwarder,
       boundary,
@@ -948,6 +1110,8 @@ export async function updateDriverZoneFromRequest(
     time_of_day_factor: data.time_of_day_factor,
     minimum_fee: data.minimum_fee,
     currency: data.currency,
+    pricing_mode: data.pricing_mode,
+    pricing_region_id: data.pricing_region_id,
     available: data.available,
     trust_payment_forwarder: data.trust_payment_forwarder,
   });

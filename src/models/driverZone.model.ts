@@ -1,6 +1,7 @@
 import type { Currency } from "./currency.model";
 import type { TransportMode } from "./transportMode.model";
 import type { SchedulePattern } from "./zoneSchedule.model";
+import type { ZonePricingMode } from "./pricingRegion.model";
 
 export interface LatLngPoint {
   lat: number;
@@ -52,6 +53,9 @@ export interface DriverZoneRow {
   time_of_day_factor: number | null;
   minimum_fee: number | null;
   currency: Currency;
+  /** system = auto-calculate from rates; manual = transporter quotes per route. */
+  pricing_mode: ZonePricingMode;
+  pricing_region_id: number | null;
   available: boolean;
   trust_payment_forwarder: boolean;
   created_at: Date;
@@ -100,6 +104,8 @@ export interface DriverZoneCreateInput {
   time_of_day_factor?: number | null;
   minimum_fee?: number | null;
   currency: Currency;
+  pricing_mode?: ZonePricingMode;
+  pricing_region_id?: number | null;
   available: boolean;
   trust_payment_forwarder: boolean;
 }
@@ -134,6 +140,8 @@ export interface DriverZoneUpdateInput {
   time_of_day_factor?: number | null;
   minimum_fee?: number | null;
   currency?: Currency;
+  pricing_mode?: ZonePricingMode;
+  pricing_region_id?: number | null;
   available?: boolean;
   trust_payment_forwarder?: boolean;
 }

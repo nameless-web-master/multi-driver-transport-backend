@@ -7,6 +7,7 @@ import type {
 import type { OrderResponse } from "../models/order.model";
 import { packageFactorForType, totalPackageFactorForEntries, type PackageType, type OrderPackageEntry } from "../models/package.model";
 import { DEFAULT_BOOKING_FEE_RATE, DEFAULT_LAND_SPEED_KMH } from "../models/pricing.model";
+import type { ZonePricingMode } from "../models/pricingRegion.model";
 import { ORDER_H3_RESOLUTION } from "./order.service";
 
 export interface DerivedSegment {
@@ -124,6 +125,8 @@ export interface SegmentCostInput {
   packageFactor?: number;
   bookingFeeRate?: number;
   landSpeedKmh?: number;
+  /** When "manual", the transporter sets cost per route — skip auto-calculation. */
+  pricingMode?: ZonePricingMode;
 }
 
 export interface SegmentCostResult {
@@ -345,6 +348,10 @@ export function calculateSegmentCost(input: SegmentCostInput): SegmentCostResult
   const method = segment.transport_method;
 
   if (transportRequiresCostRequest(method)) {
+    return emptyResult("requested", currency, packageFactor);
+  }
+
+  if (input.pricingMode === "manual") {
     return emptyResult("requested", currency, packageFactor);
   }
 

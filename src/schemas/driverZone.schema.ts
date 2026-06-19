@@ -2,6 +2,7 @@ import { z } from "zod";
 import { CURRENCIES, DEFAULT_CURRENCY } from "../models/currency.model";
 import { TRANSPORT_MODES } from "../models/transportMode.model";
 import { SCHEDULE_PATTERNS } from "../models/zoneSchedule.model";
+import { pricingModeSchema } from "./pricingRegion.schema";
 import { resolutionSchema } from "./h3.schema";
 import { latLngPointSchema } from "./h3Polygon.schema";
 
@@ -163,9 +164,36 @@ const zoneBaseFields = {
   time_of_day_factor: rateFieldSchema,
   minimum_fee: rateFieldSchema,
   currency: currencySchema.optional().default(DEFAULT_CURRENCY),
+  pricing_mode: pricingModeSchema.optional().default("system"),
+  pricing_region_id: z.coerce.number().int().positive().optional().nullable(),
   available: z.boolean(),
   trust_payment_forwarder: z.boolean(),
 };
+
+function refinePricingFields(
+  data: {
+    pricing_mode?: string;
+    pricing_region_id?: number | null;
+    base_fee?: number | null;
+    cost_per_km?: number | null;
+    cost_per_hour?: number | null;
+  },
+  ctx: z.RefinementCtx
+): void {
+  const mode = data.pricing_mode ?? "system";
+  if (mode !== "system") return;
+  const hasRegion = data.pricing_region_id != null;
+  const hasRate =
+    data.base_fee != null || data.cost_per_km != null || data.cost_per_hour != null;
+  if (!hasRegion && !hasRate) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["pricing_region_id"],
+      message:
+        "System pricing requires a pricing region or at least one rate (base, cost per km, or cost per hour)",
+    });
+  }
+}
 
 function isHubTransportMode(mode: string): boolean {
   return mode === "air" || mode === "sea";
@@ -190,6 +218,7 @@ export const createDriverZoneSchema = z
   })
   .superRefine((data, ctx) => {
     refineScheduleFields(data, ctx);
+    refinePricingFields(data, ctx);
     if (isHubRoutePayload(data)) {
       if (!data.departure_hub) {
         ctx.addIssue({
@@ -288,6 +317,8 @@ export const updateDriverZoneSchema = z
     time_of_day_factor: rateFieldSchema,
     minimum_fee: rateFieldSchema,
     currency: currencySchema.optional(),
+    pricing_mode: pricingModeSchema.optional(),
+    pricing_region_id: z.coerce.number().int().positive().optional().nullable(),
     available: z.boolean().optional(),
     trust_payment_forwarder: z.boolean().optional(),
   })
@@ -352,6 +383,18 @@ export interface DriverZoneResponse {
   time_of_day_factor: number | null;
   minimum_fee: number | null;
   currency: string;
+  pricing_mode: string;
+  pricing_region_id: number | null;
+  pricing_region_name?: string | null;
+  region_rates?: {
+    base_fee: number | null;
+    cost_per_km: number | null;
+    cost_per_hour: number | null;
+  } | null;
+  /** Effective rates after merging zone overrides with regional defaults. */
+  effective_base_fee?: number | null;
+  effective_cost_per_km?: number | null;
+  effective_cost_per_hour?: number | null;
   available: boolean;
   trust_payment_forwarder: boolean;
   driver_trustworthiness?: number;

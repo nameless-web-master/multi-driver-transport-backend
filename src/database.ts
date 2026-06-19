@@ -592,6 +592,50 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`ALTER TABLE route_segment_costs ADD COLUMN IF NOT EXISTS cost_source TEXT;`);
     await client.query(`ALTER TABLE route_cost_summaries ADD COLUMN IF NOT EXISTS requested_segment_count INTEGER NOT NULL DEFAULT 0;`);
 
+    // Regional pricing defaults — admin-managed rates (e.g. minimum wage per region).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS pricing_regions (
+        id              SERIAL PRIMARY KEY,
+        name            TEXT NOT NULL UNIQUE,
+        base_fee        NUMERIC(12, 2),
+        cost_per_km     NUMERIC(12, 4),
+        cost_per_hour   NUMERIC(12, 4),
+        currency        TEXT NOT NULL DEFAULT 'CAD',
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+    await client.query(`ALTER TABLE pricing_regions DROP CONSTRAINT IF EXISTS pricing_regions_currency_check;`);
+    await client.query(
+      `ALTER TABLE pricing_regions
+         ADD CONSTRAINT pricing_regions_currency_check CHECK (currency IN (${currencyList}));`
+    );
+
+    await client.query(
+      `ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS pricing_mode TEXT NOT NULL DEFAULT 'system';`
+    );
+    await client.query(
+      `ALTER TABLE driver_zones ADD COLUMN IF NOT EXISTS pricing_region_id INTEGER REFERENCES pricing_regions(id) ON DELETE SET NULL;`
+    );
+    await client.query(`ALTER TABLE driver_zones DROP CONSTRAINT IF EXISTS driver_zones_pricing_mode_check;`);
+    await client.query(
+      `ALTER TABLE driver_zones
+         ADD CONSTRAINT driver_zones_pricing_mode_check CHECK (pricing_mode IN ('system', 'manual'));`
+    );
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_driver_zones_pricing_region ON driver_zones (pricing_region_id);`
+    );
+
+    await client.query(
+      `INSERT INTO pricing_regions (name, base_fee, cost_per_km, cost_per_hour, currency)
+       VALUES
+         ('Ontario', 15, 1.25, 22, 'CAD'),
+         ('British Columbia', 15, 1.35, 24, 'CAD'),
+         ('Alberta', 15, 1.20, 21, 'CAD'),
+         ('Quebec', 15, 1.30, 21.5, 'CAD')
+       ON CONFLICT (name) DO NOTHING;`
+    );
+
     console.log("[db] schema ready");
   } finally {
     client.release();

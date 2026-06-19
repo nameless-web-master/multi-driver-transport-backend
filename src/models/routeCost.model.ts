@@ -86,6 +86,13 @@ export interface RouteSegmentCostResponse {
   to_node_id: string;
   to_label: string;
   transport_method: string;
+  /** Zone that owns pricing for this segment (from_node when it is a zone id). */
+  zone_id: number | null;
+  zone_pricing_mode: import("./pricingRegion.model").ZonePricingMode | null;
+  pricing_region_name: string | null;
+  effective_base_fee: number | null;
+  effective_cost_per_km: number | null;
+  effective_cost_per_hour: number | null;
   distance_h3_cells: number | null;
   distance_km: number | null;
   time_hours: number | null;

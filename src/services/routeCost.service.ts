@@ -12,6 +12,12 @@ import type {
 } from "../models/routeCost.model";
 import { segmentNeedsCostEntry, segmentNeedsRecalculation } from "../models/routeCost.model";
 import { getBookingFeeRate, getLandSpeedKmh } from "./pricingConfig.service";
+import {
+  loadRegionsByIds,
+  mergeZoneRateWithRegion,
+  rateDefaultsConfigured,
+} from "./pricingRegion.service";
+import type { ZonePricingMode } from "../models/pricingRegion.model";
 import { getOrderById, type OrderContext } from "./order.service";
 import {
   DEFAULT_PREVIEW_MAX_DEPTH,
@@ -238,30 +244,81 @@ async function loadZoneCentroids(
 }
 
 /**
- * Load per-zone pricing rules. A zone is only included if it has at least one
- * rate field configured; zones with no pricing are omitted so their segment is
- * reported as "missing cost" (requires manual entry).
+ * Load per-zone pricing rules. Merges zone overrides with regional defaults
+ * when pricing_mode is "system". Manual-mode zones are included with their
+ * mode flag but may have null rates.
  */
-async function loadZoneRates(zoneIds: number[]): Promise<Map<number, SegmentRate>> {
+interface ZonePricingEntry {
+  pricing_mode: ZonePricingMode;
+  pricing_region_name: string | null;
+  effective_base_fee: number | null;
+  effective_cost_per_km: number | null;
+  effective_cost_per_hour: number | null;
+  rate: SegmentRate | null;
+}
+
+function nodeIdToZoneId(nodeId: string): number | null {
+  const trimmed = nodeId.trim();
+  const n = Number(trimmed);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return null;
+  if (trimmed !== String(n)) return null;
+  return n;
+}
+
+async function loadZonePricing(zoneIds: number[]): Promise<Map<number, ZonePricingEntry>> {
   if (zoneIds.length === 0) return new Map();
   const result = await pool.query(
-    `SELECT id, currency, base_fee, cost_per_km, cost_per_hour
-     FROM driver_zones WHERE id = ANY($1::int[])`,
+    `SELECT dz.id, dz.currency, dz.pricing_mode, dz.pricing_region_id,
+            dz.base_fee, dz.cost_per_km, dz.cost_per_hour,
+            pr.name AS pricing_region_name
+     FROM driver_zones dz
+     LEFT JOIN pricing_regions pr ON pr.id = dz.pricing_region_id
+     WHERE dz.id = ANY($1::int[])`,
     [zoneIds]
   );
   const num = (v: unknown): number | null =>
     v == null || !Number.isFinite(Number(v)) ? null : Number(v);
-  const map = new Map<number, SegmentRate>();
+
+  const regionIds = [
+    ...new Set(
+      result.rows
+        .map((r) => (r.pricing_region_id == null ? null : Number(r.pricing_region_id)))
+        .filter((id): id is number => id != null)
+    ),
+  ];
+  const regions = await loadRegionsByIds(regionIds);
+
+  const map = new Map<number, ZonePricingEntry>();
   for (const row of result.rows) {
+    const pricingMode: ZonePricingMode =
+      String(row.pricing_mode ?? "system") === "manual" ? "manual" : "system";
+    const regionId =
+      row.pricing_region_id == null ? null : Number(row.pricing_region_id);
+    const merged = mergeZoneRateWithRegion(
+      {
+        base_fee: num(row.base_fee),
+        cost_per_km: num(row.cost_per_km),
+        cost_per_hour: num(row.cost_per_hour),
+        currency: String(row.currency ?? "CAD"),
+      },
+      regionId != null ? regions.get(regionId) ?? null : null
+    );
     const rate: SegmentRate = {
-      currency: String(row.currency ?? "CAD"),
-      base_fee: num(row.base_fee),
-      cost_per_km: num(row.cost_per_km),
-      cost_per_hour: num(row.cost_per_hour),
+      currency: merged.currency,
+      base_fee: merged.base_fee,
+      cost_per_km: merged.cost_per_km,
+      cost_per_hour: merged.cost_per_hour,
     };
-    const configured =
-      rate.base_fee != null || rate.cost_per_km != null || rate.cost_per_hour != null;
-    if (configured) map.set(Number(row.id), rate);
+    const configured = rateDefaultsConfigured(merged);
+    map.set(Number(row.id), {
+      pricing_mode: pricingMode,
+      pricing_region_name:
+        row.pricing_region_name == null ? null : String(row.pricing_region_name),
+      effective_base_fee: merged.base_fee,
+      effective_cost_per_km: merged.cost_per_km,
+      effective_cost_per_hour: merged.cost_per_hour,
+      rate: configured ? rate : null,
+    });
   }
   return map;
 }
@@ -671,7 +728,7 @@ export async function calculateRouteCost(
   const zoneIds = parseJsonIntArray(route.zone_ids);
   const zoneMeta = await loadZoneMetaForIds(zoneIds);
   const zoneCoords = await loadZoneCentroids(zoneIds);
-  const zoneRates = await loadZoneRates(zoneIds);
+  const zonePricing = await loadZonePricing(zoneIds);
   const zoneLineDistances = await loadZoneLineDistances(zoneIds);
   const connectionIds = parseJsonIntArray(route.connection_ids);
   const connectionsById = await loadConnectionsByIds(connectionIds);
@@ -734,7 +791,8 @@ export async function calculateRouteCost(
   for (const seg of segments) {
     const zoneId = seg.from_zone_id;
     const zoneInfo = zoneId != null ? zoneMeta.get(zoneId) : null;
-    const rate = zoneId != null ? zoneRates.get(zoneId) ?? null : null;
+    const pricingEntry = zoneId != null ? zonePricing.get(zoneId) ?? null : null;
+    const rate = pricingEntry?.rate ?? null;
     const lineDistanceKm = zoneId != null ? zoneLineDistances.get(zoneId) ?? null : null;
     const cost = calculateSegmentCost({
       segment: seg,
@@ -747,6 +805,7 @@ export async function calculateRouteCost(
       distanceOverride: segmentDistances.get(seg.segment_index),
       bookingFeeRate,
       landSpeedKmh,
+      pricingMode: pricingEntry?.pricing_mode ?? "system",
     });
 
     const preserved = preservedManual.get(seg.segment_index);
@@ -816,7 +875,12 @@ export async function calculateRouteCost(
     );
 
     segmentRows.push(
-      await buildSegmentResponse(insert.rows[0], zoneMeta, await loadTransporterNames([seg.transporter_id]))
+      await buildSegmentResponse(
+        insert.rows[0],
+        zoneMeta,
+        await loadTransporterNames([seg.transporter_id]),
+        zonePricing
+      )
     );
   }
 
@@ -852,7 +916,8 @@ export async function calculateRouteCost(
 async function buildSegmentResponse(
   row: Record<string, unknown>,
   zoneMeta: Map<number, { zone_name: string }>,
-  transporterNames: Map<number, string>
+  transporterNames: Map<number, string>,
+  zonePricing?: Map<number, ZonePricingEntry>
 ): Promise<RouteSegmentCostResponse> {
   const zoneNames = new Map<number, string>();
   zoneMeta.forEach((v, k) => zoneNames.set(k, v.zone_name));
@@ -866,6 +931,8 @@ async function buildSegmentResponse(
   }
 
   const tid = Number(row.transporter_id);
+  const zoneId = nodeIdToZoneId(String(row.from_node_id));
+  const pricing = zoneId != null ? zonePricing?.get(zoneId) ?? null : null;
   return {
     segment_id: Number(row.id),
     segment_index: Number(row.segment_index),
@@ -876,6 +943,12 @@ async function buildSegmentResponse(
     to_node_id: String(row.to_node_id),
     to_label: nodeLabel(String(row.to_node_id), zoneNames),
     transport_method: String(row.transport_method),
+    zone_id: zoneId,
+    zone_pricing_mode: pricing?.pricing_mode ?? null,
+    pricing_region_name: pricing?.pricing_region_name ?? null,
+    effective_base_fee: pricing?.effective_base_fee ?? null,
+    effective_cost_per_km: pricing?.effective_cost_per_km ?? null,
+    effective_cost_per_hour: pricing?.effective_cost_per_hour ?? null,
     distance_h3_cells: row.distance_h3_cells != null ? Number(row.distance_h3_cells) : null,
     distance_km: row.distance_km != null ? Number(row.distance_km) : null,
     time_hours: row.time_hours != null ? Number(row.time_hours) : null,
@@ -946,6 +1019,8 @@ export async function getRouteCostSummary(
   const zoneIds = parseJsonIntArray(route.zone_ids);
   const zoneMeta = await loadZoneMetaForIds(zoneIds);
 
+  const zonePricing = await loadZonePricing(zoneIds);
+
   // Recompute when there are no rows yet, when any segment is `missing` (rates
   // newly configured), or when segmentation is stale. `requested` (e.g. air
   // awaiting quote) is stable and must NOT trigger recalc on every read.
@@ -963,7 +1038,7 @@ export async function getRouteCostSummary(
 
   const segments: RouteSegmentCostResponse[] = [];
   for (const row of segResult.rows) {
-    segments.push(await buildSegmentResponse(row, zoneMeta, names));
+    segments.push(await buildSegmentResponse(row, zoneMeta, names, zonePricing));
   }
 
   return buildRouteSummaryResponse(route, order, segments);
@@ -1139,10 +1214,12 @@ export async function requestSegmentQuote(
 
   await recalculateRouteSummary(Number(seg.route_id));
 
-  const zoneMeta = await loadZoneMetaForIds(parseJsonIntArray(seg.zone_ids));
+  const zoneIds = parseJsonIntArray(seg.zone_ids);
+  const zoneMeta = await loadZoneMetaForIds(zoneIds);
+  const zonePricing = await loadZonePricing(zoneIds);
   const names = await loadTransporterNames([Number(seg.transporter_id)]);
   const updated = await pool.query(`SELECT * FROM route_segment_costs WHERE id = $1`, [segmentCostId]);
-  return buildSegmentResponse(updated.rows[0], zoneMeta, names);
+  return buildSegmentResponse(updated.rows[0], zoneMeta, names, zonePricing);
 }
 
 async function applyQuotedSegmentCost(
@@ -1178,10 +1255,12 @@ async function applyQuotedSegmentCost(
 
   await recalculateRouteSummary(Number(seg.route_id));
 
-  const zoneMeta = await loadZoneMetaForIds(parseJsonIntArray(seg.zone_ids));
+  const zoneIdsQuoted = parseJsonIntArray(seg.zone_ids);
+  const zoneMeta = await loadZoneMetaForIds(zoneIdsQuoted);
+  const zonePricing = await loadZonePricing(zoneIdsQuoted);
   const names = await loadTransporterNames([Number(seg.transporter_id)]);
   const updated = await pool.query(`SELECT * FROM route_segment_costs WHERE id = $1`, [segmentCostId]);
-  return buildSegmentResponse(updated.rows[0], zoneMeta, names);
+  return buildSegmentResponse(updated.rows[0], zoneMeta, names, zonePricing);
 }
 
 async function recalculateRouteSummary(routeId: number): Promise<void> {
@@ -1381,8 +1460,9 @@ export async function listTransporterQuoteRequests(
   for (const row of result.rows) {
     const zoneIds = parseJsonIntArray(row.zone_ids);
     const zoneMeta = await loadZoneMetaForIds(zoneIds);
+    const zonePricing = await loadZonePricing(zoneIds);
     const names = await loadTransporterNames([Number(row.transporter_id)]);
-    const segment = await buildSegmentResponse(row, zoneMeta, names);
+    const segment = await buildSegmentResponse(row, zoneMeta, names, zonePricing);
 
     const dims =
       row.package_length != null &&

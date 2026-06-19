@@ -62,6 +62,7 @@ app.get("/api/health", (_req, res) => {
       "order-graph",
       "route-cost",
       "pricing-config",
+      "pricing-regions",
       "transporter-rate-tables-deprecated",
     ],
   });
