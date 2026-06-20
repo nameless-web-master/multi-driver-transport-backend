@@ -132,6 +132,12 @@ export interface OrderDraftZoneSummary {
   month_day_end: number | null;
   operating_start_time: string | null;
   operating_end_time: string | null;
+  base_fee: number | null;
+  cost_per_km: number | null;
+  cost_per_hour: number | null;
+  currency: string;
+  trust_payment_forwarder: boolean;
+  driver_trustworthiness: number;
 }
 
 export interface OrderDraftHub {
@@ -254,6 +260,12 @@ interface ZoneMeta {
   month_day_end: number | null;
   operating_start_time: string | null;
   operating_end_time: string | null;
+  base_fee: number | null;
+  cost_per_km: number | null;
+  cost_per_hour: number | null;
+  currency: string;
+  trust_payment_forwarder: boolean;
+  driver_trustworthiness: number;
 }
 
 interface ConnectionRow {
@@ -328,6 +340,9 @@ async function loadZoneMeta(): Promise<ZoneMeta[]> {
             z.schedule_pattern, z.weekday_start, z.weekday_end,
             z.month_day_start, z.month_day_end,
             z.operating_start_time, z.operating_end_time,
+            z.base_fee, z.cost_per_km, z.cost_per_hour, z.currency,
+            z.trust_payment_forwarder,
+            COALESCE(u.trustworthiness, 0) AS driver_trustworthiness,
             u.full_name AS transport_name
      FROM driver_zones z
      JOIN users u ON u.id = z.owner_user_id
@@ -359,6 +374,12 @@ async function loadZoneMeta(): Promise<ZoneMeta[]> {
         month_day_end: schedule.month_day_end,
         operating_start_time: schedule.operating_start_time,
         operating_end_time: schedule.operating_end_time,
+        base_fee: row.base_fee == null ? null : Number(row.base_fee),
+        cost_per_km: row.cost_per_km == null ? null : Number(row.cost_per_km),
+        cost_per_hour: row.cost_per_hour == null ? null : Number(row.cost_per_hour),
+        currency: row.currency == null ? "USD" : String(row.currency),
+        trust_payment_forwarder: Boolean(row.trust_payment_forwarder),
+        driver_trustworthiness: Number(row.driver_trustworthiness ?? 0),
       };
     })
     .filter((z) =>
@@ -952,6 +973,12 @@ function zoneMetaToSummary(
     month_day_end: z.month_day_end,
     operating_start_time: z.operating_start_time,
     operating_end_time: z.operating_end_time,
+    base_fee: z.base_fee,
+    cost_per_km: z.cost_per_km,
+    cost_per_hour: z.cost_per_hour,
+    currency: z.currency,
+    trust_payment_forwarder: z.trust_payment_forwarder,
+    driver_trustworthiness: z.driver_trustworthiness,
   };
 }
 
