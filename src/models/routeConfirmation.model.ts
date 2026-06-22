@@ -1,0 +1,113 @@
+import type { TrackingStatus } from "./orderTracking.model";
+
+export const ROUTE_SELECTION_STATUSES = [
+  "pending",
+  "confirmed",
+  "rejected",
+  "partially_confirmed",
+] as const;
+export type RouteSelectionStatus = (typeof ROUTE_SELECTION_STATUSES)[number];
+
+export const PAYMENT_STATUSES = ["pending", "ready", "not_required"] as const;
+export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
+
+export const SEGMENT_LEG_STATUSES = ["not_started", "picked_up", "in_transit"] as const;
+export type SegmentLegStatus = (typeof SEGMENT_LEG_STATUSES)[number];
+
+export function isSegmentLegStatus(value: unknown): value is SegmentLegStatus {
+  return typeof value === "string" && (SEGMENT_LEG_STATUSES as readonly string[]).includes(value);
+}
+
+export const SEGMENT_CONFIRMATION_STATUSES = ["pending", "accepted", "rejected"] as const;
+export type SegmentConfirmationStatus = (typeof SEGMENT_CONFIRMATION_STATUSES)[number];
+
+export const CONFIRMATION_REQUEST_STATUSES = ["sent", "accepted", "rejected", "expired"] as const;
+export type ConfirmationRequestStatus = (typeof CONFIRMATION_REQUEST_STATUSES)[number];
+
+export interface RouteSelectionRow {
+  id: number;
+  order_id: number;
+  selected_route_id: number;
+  selected_by_user_id: number;
+  status: RouteSelectionStatus;
+  payment_status: PaymentStatus;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface SegmentConfirmationRow {
+  id: number;
+  route_id: number;
+  segment_id: number;
+  transporter_id: number;
+  status: SegmentConfirmationStatus;
+  leg_status: SegmentLegStatus;
+  rejection_reason: string | null;
+  confirmed_at: Date | null;
+  created_at: Date;
+}
+
+export interface SegmentConfirmationDetail {
+  segment_id: number;
+  segment_index: number;
+  transporter_id: number;
+  transporter_name: string;
+  from_node_id: string;
+  from_label: string;
+  to_node_id: string;
+  to_label: string;
+  status: SegmentConfirmationStatus;
+  leg_status: SegmentLegStatus;
+  rejection_reason: string | null;
+  confirmed_at: string | null;
+  final_cost: number | null;
+  currency: string;
+}
+
+export interface RouteConfirmationStatusResponse {
+  route_id: number;
+  order_id: number;
+  route_label: string;
+  selection_status: RouteSelectionStatus;
+  payment_status: PaymentStatus;
+  confirmed_count: number;
+  pending_count: number;
+  rejected_count: number;
+  total_segments: number;
+  progress_percent: number;
+  segments: SegmentConfirmationDetail[];
+}
+
+export interface RouteSelectionResponse {
+  id: number;
+  order_id: number;
+  selected_route_id: number;
+  selected_by_user_id: number;
+  status: RouteSelectionStatus;
+  payment_status: PaymentStatus;
+  route_label: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TransporterConfirmationItem {
+  confirmation_id: number;
+  route_id: number;
+  order_id: number;
+  segment_id: number;
+  segment_index: number;
+  from_label: string;
+  to_label: string;
+  status: SegmentConfirmationStatus;
+  leg_status: SegmentLegStatus;
+  rejection_reason: string | null;
+  route_label: string;
+  sender_address: string;
+  destination_address: string;
+  sent_at: string;
+  route_selection_status: RouteSelectionStatus | null;
+  order_tracking_status: TrackingStatus;
+  pickup_ready_at: string | null;
+  route_segment_count: number;
+  previous_leg_status: SegmentLegStatus | null;
+}

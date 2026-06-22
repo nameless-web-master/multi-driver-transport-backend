@@ -24,6 +24,21 @@ import {
   compareOrderRoutes,
   recalculateRouteCostsForOrder,
 } from "../services/routeCost.service";
+import {
+  RouteConfirmationError,
+  getSelectedRoute,
+} from "../services/route_confirmation.service";
+import {
+  getSenderOrderView,
+  getReceiverOrderView,
+  OrderViewError,
+} from "../services/orderView.service";
+import {
+  getOrderStatus,
+  updateOrderStatus as updateTrackingStatus,
+  OrderStatusError,
+} from "../services/order_status.service";
+import { TRACKING_STATUSES } from "../models/orderTracking.model";
 
 export const ordersRouter = Router();
 
@@ -51,6 +66,18 @@ function handle(res: Response, err: unknown) {
     return;
   }
   if (err instanceof RouteCostError) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  if (err instanceof RouteConfirmationError) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  if (err instanceof OrderViewError) {
+    res.status(err.status).json({ error: err.message });
+    return;
+  }
+  if (err instanceof OrderStatusError) {
     res.status(err.status).json({ error: err.message });
     return;
   }
@@ -104,6 +131,83 @@ ordersRouter.get("/", async (req: AuthenticatedRequest, res: Response) => {
   try {
     const orders = await listOrders(ctx(req));
     res.json(orders);
+  } catch (err) {
+    handle(res, err);
+  }
+});
+
+ordersRouter.get("/:id/selected-route", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  try {
+    const selection = await getSelectedRoute(id, ctx(req));
+    if (!selection) return res.status(404).json({ error: "No route selected for this order" });
+    res.json(selection);
+  } catch (err) {
+    handle(res, err);
+  }
+});
+
+ordersRouter.get("/:id/sender-view", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  try {
+    const view = await getSenderOrderView(id, ctx(req));
+    res.json(view);
+  } catch (err) {
+    handle(res, err);
+  }
+});
+
+ordersRouter.get("/:id/receiver-view", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  try {
+    const view = await getReceiverOrderView(id, ctx(req));
+    res.json(view);
+  } catch (err) {
+    handle(res, err);
+  }
+});
+
+const updateTrackingStatusSchema = z.object({
+  status: z.enum(TRACKING_STATUSES),
+});
+
+ordersRouter.get("/:id/tracking-status", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  try {
+    const status = await getOrderStatus(id, ctx(req));
+    res.json(status);
+  } catch (err) {
+    handle(res, err);
+  }
+});
+
+ordersRouter.patch("/:id/tracking-status", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  const parsed = updateTrackingStatusSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Validation failed",
+      details: parsed.error.flatten().fieldErrors,
+    });
+  }
+  try {
+    const status = await updateTrackingStatus(id, parsed.data.status, ctx(req));
+    res.json(status);
   } catch (err) {
     handle(res, err);
   }

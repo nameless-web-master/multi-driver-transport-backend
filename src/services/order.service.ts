@@ -6,6 +6,22 @@ import {
   isOrderStatus,
   type OrderStatus,
 } from "../models/order.model";
+import { isTrackingStatus, type TrackingStatus } from "../models/orderTracking.model";
+import type { RouteSelectionStatus } from "../models/routeConfirmation.model";
+
+const ROUTE_SELECTION_STATUSES = [
+  "pending",
+  "confirmed",
+  "rejected",
+  "partially_confirmed",
+] as const;
+
+function isRouteSelectionStatus(value: unknown): value is RouteSelectionStatus {
+  return (
+    typeof value === "string" &&
+    (ROUTE_SELECTION_STATUSES as readonly string[]).includes(value)
+  );
+}
 import type { UserRole } from "../models/userRole.model";
 import {
   CreateOrderRequest,
@@ -53,14 +69,52 @@ export class OrderError extends Error {
   }
 }
 
+/** Keep legacy orders.status in sync with tracking_status for list views still using it. */
+export async function syncLegacyOrderStatus(
+  orderId: number,
+  trackingStatus: TrackingStatus
+): Promise<void> {
+  if (trackingStatus === "DELIVERED") {
+    await pool.query(
+      `UPDATE orders
+       SET status = 'received',
+           received_at = COALESCE(received_at, NOW()),
+           updated_at = NOW()
+       WHERE id = $1`,
+      [orderId]
+    );
+    return;
+  }
+
+  if (
+    trackingStatus === "PICKUP_AVAILABLE" ||
+    trackingStatus === "PICKED_UP" ||
+    trackingStatus === "IN_TRANSIT"
+  ) {
+    await pool.query(
+      `UPDATE orders
+       SET status = 'delivering',
+           delivering_at = COALESCE(delivering_at, NOW()),
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'submitted'`,
+      [orderId]
+    );
+  }
+}
+
 const ORDER_SELECT = `
   SELECT o.*,
          s.full_name AS sender_name,
          s.phone     AS sender_phone_user,
-         r.full_name AS receiver_name
+         r.full_name AS receiver_name,
+         rs.status AS route_selection_status,
+         rs.selected_route_id,
+         sel_r.route_label AS selected_route_label
   FROM orders o
   JOIN users s ON s.id = o.sender_user_id
   JOIN users r ON r.id = o.receiver_user_id
+  LEFT JOIN route_selections rs ON rs.order_id = o.id
+  LEFT JOIN order_routes sel_r ON sel_r.id = rs.selected_route_id
 `;
 
 function toNullable(value: unknown): number | null {
@@ -79,9 +133,11 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
       ? Number(row.driver_user_id)
       : null,
     sender_address: String(row.sender_address ?? ""),
+    sender_billing_address: String(row.sender_billing_address ?? ""),
     sender_lat: toNullable(row.sender_lat),
     sender_lng: toNullable(row.sender_lng),
     destination_address: String(row.destination_address ?? ""),
+    receiver_billing_address: String(row.receiver_billing_address ?? ""),
     destination_lat: toNullable(row.destination_lat),
     destination_lng: toNullable(row.destination_lng),
     receiver_phone: String(row.receiver_phone ?? ""),
@@ -118,6 +174,10 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
     package_dimension_unit: String(row.package_dimension_unit ?? "in"),
     dimensions: String(row.dimensions ?? ""),
     status,
+    tracking_status: (isTrackingStatus(row.tracking_status)
+      ? row.tracking_status
+      : "CONFIRMED") as TrackingStatus,
+    pickup_ready_at: row.pickup_ready_at ? new Date(String(row.pickup_ready_at)) : null,
     submitted_at: new Date(String(row.submitted_at)),
     delivering_at: row.delivering_at ? new Date(String(row.delivering_at)) : null,
     received_at: row.received_at ? new Date(String(row.received_at)) : null,
@@ -135,9 +195,11 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
     receiver_name: String(row.receiver_name ?? ""),
     receiver_phone: order.receiver_phone,
     sender_address: order.sender_address,
+    sender_billing_address: order.sender_billing_address,
     sender_lat: order.sender_lat,
     sender_lng: order.sender_lng,
     destination_address: order.destination_address,
+    receiver_billing_address: order.receiver_billing_address,
     destination_lat: order.destination_lat,
     destination_lng: order.destination_lng,
     notes: order.notes,
@@ -160,6 +222,15 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
     package_dimension_unit: order.package_dimension_unit,
     dimensions: order.dimensions,
     status: order.status,
+    tracking_status: order.tracking_status,
+    pickup_ready_at: order.pickup_ready_at?.toISOString() ?? null,
+    route_selection_status: isRouteSelectionStatus(row.route_selection_status)
+      ? row.route_selection_status
+      : null,
+    selected_route_id:
+      row.selected_route_id != null ? Number(row.selected_route_id) : null,
+    selected_route_label:
+      row.selected_route_label != null ? String(row.selected_route_label) : null,
     submitted_at: order.submitted_at.toISOString(),
     delivering_at: order.delivering_at?.toISOString() ?? null,
     received_at: order.received_at?.toISOString() ?? null,
@@ -197,12 +268,18 @@ export async function createOrder(
   );
   const senderRow = sender.rows[0] ?? {};
 
-  const senderAddress = data.sender_address?.trim() || String(senderRow.address ?? "");
+  const senderBillingAddress =
+    data.sender_billing_address?.trim() || String(senderRow.address ?? "");
+  const pickupAddress = data.sender_address?.trim() || senderBillingAddress;
   const senderLat = data.sender_lat ?? toNullable(senderRow.lat);
   const senderLng = data.sender_lng ?? toNullable(senderRow.lng);
 
-  const destinationLat = toNullable(r.lat);
-  const destinationLng = toNullable(r.lng);
+  const receiverBillingAddress =
+    data.receiver_billing_address?.trim() || String(r.address ?? "");
+  const deliveryAddress =
+    data.destination_address?.trim() || String(r.address ?? "");
+  const destinationLat = data.destination_lat ?? toNullable(r.lat);
+  const destinationLng = data.destination_lng ?? toNullable(r.lng);
 
   // Milestone 1 (updated scope): convert pickup + delivery coordinates to
   // H3 indexes and persist them with the order so later milestones (and the
@@ -235,8 +312,8 @@ export async function createOrder(
   const insert = await pool.query(
     `INSERT INTO orders
        (sender_user_id, receiver_user_id, driver_user_id,
-        sender_address, sender_lat, sender_lng,
-        destination_address, destination_lat, destination_lng,
+        sender_address, sender_billing_address, sender_lat, sender_lng,
+        destination_address, receiver_billing_address, destination_lat, destination_lng,
         receiver_phone, notes,
         pickup_h3, delivery_h3, h3_resolution,
         source_name, source_contact, payment_method, shipping_method,
@@ -244,20 +321,22 @@ export async function createOrder(
         weight_kg, weight_lbs, package_weight_unit,
         package_length, package_width, package_height, package_dimension_unit,
         dimensions,
-        status, submitted_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-             $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
-             $23, $24, $25, $26, $27, $28, $29, $30,
-             'submitted', NOW())
+        status, tracking_status, submitted_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+             $14, $15, $16, $17, $18, $19, $20, $21, $22,
+             $23, $24, $25, $26, $27, $28, $29, $30, $31, $32,
+             'submitted', 'CONFIRMED', NOW())
      RETURNING id`,
     [
       ctx.userId,
       data.receiver_user_id,
       data.driver_user_id ?? null,
-      senderAddress,
+      pickupAddress,
+      senderBillingAddress,
       senderLat,
       senderLng,
-      String(r.address ?? ""),
+      deliveryAddress,
+      receiverBillingAddress,
       destinationLat,
       destinationLng,
       String(r.phone ?? ""),

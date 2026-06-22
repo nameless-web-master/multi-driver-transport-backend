@@ -13,9 +13,11 @@ export interface OrderRow {
   receiver_user_id: number;
   driver_user_id: number | null;
   sender_address: string;
+  sender_billing_address: string;
   sender_lat: number | null;
   sender_lng: number | null;
   destination_address: string;
+  receiver_billing_address: string;
   destination_lat: number | null;
   destination_lng: number | null;
   receiver_phone: string;
@@ -39,6 +41,8 @@ export interface OrderRow {
   package_dimension_unit: string;
   dimensions: string;
   status: OrderStatus;
+  tracking_status: import("./orderTracking.model").TrackingStatus;
+  pickup_ready_at: Date | null;
   submitted_at: Date;
   delivering_at: Date | null;
   received_at: Date | null;
@@ -56,9 +60,11 @@ export interface OrderResponse {
   receiver_name: string;
   receiver_phone: string;
   sender_address: string;
+  sender_billing_address: string;
   sender_lat: number | null;
   sender_lng: number | null;
   destination_address: string;
+  receiver_billing_address: string;
   destination_lat: number | null;
   destination_lng: number | null;
   notes: string;
@@ -81,6 +87,12 @@ export interface OrderResponse {
   package_dimension_unit: string;
   dimensions: string;
   status: OrderStatus;
+  tracking_status: import("./orderTracking.model").TrackingStatus;
+  pickup_ready_at: string | null;
+  /** Milestone 6/7 — populated on list/detail when a route has been selected. */
+  route_selection_status?: import("./routeConfirmation.model").RouteSelectionStatus | null;
+  selected_route_id?: number | null;
+  selected_route_label?: string | null;
   submitted_at: string;
   delivering_at: string | null;
   received_at: string | null;

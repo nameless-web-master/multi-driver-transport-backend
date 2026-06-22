@@ -404,6 +404,9 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`ALTER TABLE orders ALTER COLUMN package_dimension_unit SET DEFAULT 'in';`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_pickup_h3 ON orders (pickup_h3);`);
     await client.query(`CREATE INDEX IF NOT EXISTS idx_orders_delivery_h3 ON orders (delivery_h3);`);
+    // Billing addresses are separate from pickup/delivery routing coordinates.
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS sender_billing_address TEXT NOT NULL DEFAULT '';`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS receiver_billing_address TEXT NOT NULL DEFAULT '';`);
 
     // ----------------------------------------------------------------------
     // Milestone 2: zone overlap / adjacency graph.
@@ -634,6 +637,119 @@ export async function ensureSchema(): Promise<void> {
          ('Alberta', 15, 1.20, 21, 'CAD'),
          ('Quebec', 15, 1.30, 21.5, 'CAD')
        ON CONFLICT (name) DO NOTHING;`
+    );
+
+    // ----------------------------------------------------------------------
+    // Milestone 6 — route selection & segment confirmation.
+    // ----------------------------------------------------------------------
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS route_selections (
+        id                  SERIAL PRIMARY KEY,
+        order_id            INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        selected_route_id   INTEGER NOT NULL REFERENCES order_routes(id) ON DELETE CASCADE,
+        selected_by_user_id INTEGER NOT NULL REFERENCES users(id),
+        status              TEXT    NOT NULL DEFAULT 'pending',
+        payment_status      TEXT    NOT NULL DEFAULT 'pending',
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT route_selections_order_unique UNIQUE (order_id),
+        CONSTRAINT route_selections_status_check
+          CHECK (status IN ('pending', 'confirmed', 'rejected', 'partially_confirmed')),
+        CONSTRAINT route_selections_payment_status_check
+          CHECK (payment_status IN ('pending', 'ready', 'not_required'))
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_route_selections_order ON route_selections (order_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_route_selections_route ON route_selections (selected_route_id);`);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS segment_confirmations (
+        id               SERIAL PRIMARY KEY,
+        route_id         INTEGER NOT NULL REFERENCES order_routes(id) ON DELETE CASCADE,
+        segment_id       INTEGER NOT NULL REFERENCES route_segment_costs(id) ON DELETE CASCADE,
+        transporter_id   INTEGER NOT NULL REFERENCES users(id),
+        status           TEXT    NOT NULL DEFAULT 'pending',
+        rejection_reason TEXT,
+        confirmed_at     TIMESTAMPTZ,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT segment_confirmations_segment_unique UNIQUE (segment_id),
+        CONSTRAINT segment_confirmations_status_check
+          CHECK (status IN ('pending', 'accepted', 'rejected'))
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_segment_confirmations_route ON segment_confirmations (route_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_segment_confirmations_transporter ON segment_confirmations (transporter_id);`);
+    await client.query(
+      `ALTER TABLE segment_confirmations ADD COLUMN IF NOT EXISTS leg_status TEXT NOT NULL DEFAULT 'not_started';`
+    );
+    await client.query(
+      `ALTER TABLE segment_confirmations DROP CONSTRAINT IF EXISTS segment_confirmations_leg_status_check;`
+    );
+    await client.query(
+      `ALTER TABLE segment_confirmations ADD CONSTRAINT segment_confirmations_leg_status_check
+         CHECK (leg_status IN ('not_started', 'picked_up', 'in_transit'));`
+    );
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS route_confirmation_requests (
+        id             SERIAL PRIMARY KEY,
+        route_id       INTEGER NOT NULL REFERENCES order_routes(id) ON DELETE CASCADE,
+        transporter_id INTEGER NOT NULL REFERENCES users(id),
+        segment_id     INTEGER NOT NULL REFERENCES route_segment_costs(id) ON DELETE CASCADE,
+        status         TEXT    NOT NULL DEFAULT 'sent',
+        sent_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        responded_at   TIMESTAMPTZ,
+        CONSTRAINT route_confirmation_requests_segment_unique UNIQUE (segment_id),
+        CONSTRAINT route_confirmation_requests_status_check
+          CHECK (status IN ('sent', 'accepted', 'rejected', 'expired'))
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_route_confirmation_requests_route ON route_confirmation_requests (route_id);`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_route_confirmation_requests_transporter ON route_confirmation_requests (transporter_id);`);
+
+    // ----------------------------------------------------------------------
+    // Milestone 7 — order tracking status + history.
+    // ----------------------------------------------------------------------
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS tracking_status TEXT NOT NULL DEFAULT 'CONFIRMED';`);
+    await client.query(`ALTER TABLE orders ALTER COLUMN tracking_status SET DEFAULT 'CONFIRMED';`);
+    await client.query(`ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_tracking_status_check;`);
+    await client.query(
+      `ALTER TABLE orders ADD CONSTRAINT orders_tracking_status_check
+         CHECK (tracking_status IN ('CONFIRMED', 'PICKUP_AVAILABLE', 'PICKED_UP', 'IN_TRANSIT', 'DELIVERED'));`
+    );
+    // Reset rows that inherited the old PICKUP_AVAILABLE default before pick ready / delivery.
+    await client.query(
+      `UPDATE orders
+       SET tracking_status = 'CONFIRMED'
+       WHERE pickup_ready_at IS NULL
+         AND tracking_status NOT IN ('CONFIRMED', 'DELIVERED')`
+    );
+    await client.query(
+      `UPDATE orders
+       SET status = 'received',
+           received_at = COALESCE(received_at, updated_at, NOW())
+       WHERE tracking_status = 'DELIVERED' AND status <> 'received'`
+    );
+    await client.query(
+      `UPDATE orders
+       SET status = 'delivering',
+           delivering_at = COALESCE(delivering_at, updated_at, NOW())
+       WHERE tracking_status IN ('PICKUP_AVAILABLE', 'PICKED_UP', 'IN_TRANSIT')
+         AND status = 'submitted'`
+    );
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS order_status_history (
+        id         SERIAL PRIMARY KEY,
+        order_id   INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        status     TEXT    NOT NULL,
+        updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        timestamp  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_order_status_history_order ON order_status_history (order_id);`);
+    await client.query(
+      `ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_ready_at TIMESTAMPTZ;`
     );
 
     console.log("[db] schema ready");

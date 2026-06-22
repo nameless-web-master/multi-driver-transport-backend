@@ -41,8 +41,13 @@ function resolvePackagesInput(data: {
 export const createOrderSchema = z.object({
   receiver_user_id: z.number().int().positive(),
   sender_address: z.string().trim().max(300).optional().default(""),
+  sender_billing_address: z.string().trim().max(300).optional().default(""),
   sender_lat: latitudeSchema.optional().nullable(),
   sender_lng: longitudeSchema.optional().nullable(),
+  destination_address: z.string().trim().max(300).optional(),
+  destination_lat: latitudeSchema.optional().nullable(),
+  destination_lng: longitudeSchema.optional().nullable(),
+  receiver_billing_address: z.string().trim().max(300).optional().default(""),
   notes: z.string().trim().max(1000).optional().default(""),
   driver_user_id: z.number().int().positive().optional().nullable(),
   source_name: z.string().trim().max(200).optional().default(""),

@@ -18,6 +18,9 @@ import {
 import { rateTablesRouter } from "./routes/rateTables.routes";
 import { pricingRouter } from "./routes/pricing.routes";
 import { routesCostRouter, routeSegmentCostsRouter } from "./routes/routeCost.routes";
+import { routeConfirmationRouter } from "./routes/routeConfirmation.routes";
+import { segmentsRouter } from "./routes/routeConfirmation.routes";
+import { transporterRouter } from "./routes/transporter.routes";
 
 dotenv.config();
 
@@ -51,7 +54,7 @@ app.get("/api/health", (_req, res) => {
   res.json({
     status: "ok",
     service: "multi-driver-h3-backend",
-    milestone: 5,
+    milestone: 7,
     auth: true,
     features: [
       "zones",
@@ -61,6 +64,9 @@ app.get("/api/health", (_req, res) => {
       "driver-zone-graph",
       "order-graph",
       "route-cost",
+      "route-confirmation",
+      "order-tracking",
+      "role-based-views",
       "pricing-config",
       "pricing-regions",
       "transporter-rate-tables-deprecated",
@@ -86,7 +92,10 @@ app.use("/api/order-graph", orderGraphRouter);
 app.use("/api/transporter-rate-tables", rateTablesRouter);
 app.use("/api/pricing", pricingRouter);
 app.use("/api/routes", routesCostRouter);
+app.use("/api/routes", routeConfirmationRouter);
 app.use("/api/route-segment-costs", routeSegmentCostsRouter);
+app.use("/api/segments", segmentsRouter);
+app.use("/api/transporter", transporterRouter);
 
 // 404
 app.use((req, res) => {
