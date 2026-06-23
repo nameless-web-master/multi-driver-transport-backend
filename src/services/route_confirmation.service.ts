@@ -9,8 +9,8 @@ import type {
   TransporterConfirmationItem,
 } from "../models/routeConfirmation.model";
 import { isSegmentLegStatus } from "../models/routeConfirmation.model";
-import { getOrderById, type OrderContext } from "./order.service";
 import { addStatusHistory } from "./order_status.service";
+import { getOrderById, type OrderContext } from "./order.service";
 import {
   RouteCostError,
   calculateRouteCost,
