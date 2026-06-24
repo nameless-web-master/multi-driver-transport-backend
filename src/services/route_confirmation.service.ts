@@ -11,6 +11,7 @@ import type {
 import { isSegmentLegStatus } from "../models/routeConfirmation.model";
 import { addStatusHistory } from "./order_status.service";
 import { getOrderById, type OrderContext } from "./order.service";
+import { isOrderRouteLocked } from "./orderRouteLock.service";
 import {
   RouteCostError,
   calculateRouteCost,
@@ -69,6 +70,13 @@ export async function selectRoute(
   ctx: OrderContext
 ): Promise<RouteSelectionResponse> {
   await assertSenderReceiverAccess(orderId, ctx);
+
+  if (await isOrderRouteLocked(orderId)) {
+    throw new RouteConfirmationError(
+      "Cannot change route after confirmation or while delivery is in progress",
+      409
+    );
+  }
 
   const route = await loadRouteForOrder(routeId, orderId);
   if (!route) throw new RouteConfirmationError("Route not found for this order", 404);

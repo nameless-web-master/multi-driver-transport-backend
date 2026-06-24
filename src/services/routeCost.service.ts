@@ -38,6 +38,7 @@ import {
   isExternalQuoteConfigured,
   type ExternalQuoteRequest,
 } from "./externalQuote.service";
+import { getOrderRouteLockInfo, isOrderRouteLocked } from "./orderRouteLock.service";
 
 export class RouteCostError extends Error {
   status: number;
@@ -608,6 +609,13 @@ export async function syncOrderRoutesFromPreview(
   order: OrderResponse,
   liveChains?: RouteChain[]
 ): Promise<number[]> {
+  if (await isOrderRouteLocked(order.id)) {
+    const existing = await pool.query(`SELECT id FROM order_routes WHERE order_id = $1 ORDER BY route_index`, [
+      order.id,
+    ]);
+    return existing.rows.map((row) => Number(row.id));
+  }
+
   const chains = liveChains ?? (await fetchLiveRouteChains(order));
   const routeIds: number[] = [];
 
@@ -1340,16 +1348,16 @@ async function buildOrderRouteComparison(
   order?: OrderResponse
 ): Promise<OrderRouteCostComparisonResponse> {
   const orderRow = order ?? (await getOrderForCostAccess(orderId, ctx));
+  const lockInfo = await getOrderRouteLockInfo(orderId);
   const routesResult = await pool.query(
     `SELECT * FROM order_routes WHERE order_id = $1 ORDER BY route_index`,
     [orderId]
   );
 
-  // Defensive: only ever surface routes that still exist in the *current* live
-  // enumeration (the exact same set the Order page shows). This guarantees a
-  // stale `order_routes` row can never leak into the comparison even if a
-  // resync hasn't run yet, so both pages always list identical routes.
-  const liveSigs = liveChains ? new Set(liveChains.map(chainSignature)) : null;
+  // For confirmed / in-progress deliveries, keep the persisted route snapshot
+  // even when it no longer appears in the live zone graph.
+  const liveSigs =
+    !lockInfo.locked && liveChains ? new Set(liveChains.map(chainSignature)) : null;
   const storedRows = liveSigs
     ? routesResult.rows.filter((r) => liveSigs.has(storedRouteSignature(r)))
     : routesResult.rows;
@@ -1386,6 +1394,8 @@ async function buildOrderRouteComparison(
     package_weight_lbs: weightLbs,
     package_dimensions_in: dims,
     routes,
+    route_locked: lockInfo.locked,
+    route_lock_reason: lockInfo.reason,
   };
 }
 
@@ -1394,6 +1404,12 @@ export async function recalculateRouteCostsForOrder(
   ctx: OrderContext
 ): Promise<OrderRouteCostComparisonResponse> {
   const order = await getOrderForCostAccess(orderId, ctx);
+  const lockInfo = await getOrderRouteLockInfo(order.id);
+
+  if (lockInfo.locked) {
+    return buildOrderRouteComparison(orderId, ctx, undefined, order);
+  }
+
   const liveChains = await withOrderResyncLock(order.id, async () => {
     const chains = await fetchLiveRouteChains(order);
     await resyncAndCostOrder(order, ctx, chains);
@@ -1407,10 +1423,18 @@ export async function compareOrderRoutes(
   ctx: OrderContext
 ): Promise<OrderRouteCostComparisonResponse> {
   const order = await getOrderForCostAccess(orderId, ctx);
+  const lockInfo = await getOrderRouteLockInfo(order.id);
+
+  if (lockInfo.locked) {
+    return buildOrderRouteComparison(orderId, ctx, undefined, order);
+  }
 
   let liveChains = await fetchLiveRouteChains(order);
   if (await orderRoutesNeedResync(order, liveChains)) {
     liveChains = await withOrderResyncLock(order.id, async () => {
+      if (await isOrderRouteLocked(order.id)) {
+        return fetchLiveRouteChains(order);
+      }
       const freshChains = await fetchLiveRouteChains(order);
       if (await orderRoutesNeedResync(order, freshChains)) {
         await resyncAndCostOrder(order, ctx, freshChains);

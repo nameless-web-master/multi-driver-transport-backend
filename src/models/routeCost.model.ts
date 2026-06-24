@@ -139,6 +139,8 @@ export interface OrderRouteCostComparisonResponse {
   package_weight_lbs: number | null;
   package_dimensions_in: string | null;
   routes: RouteCostSummaryResponse[];
+  route_locked: boolean;
+  route_lock_reason: "confirmed_route" | "delivery_in_progress" | null;
 }
 
 /** Pending segment cost work for a transporter (quote requested or missing rates). */

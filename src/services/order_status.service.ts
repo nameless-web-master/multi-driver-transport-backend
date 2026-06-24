@@ -7,7 +7,6 @@ import {
   TRACKING_STATUSES,
 } from "../models/orderTracking.model";
 import { getOrderById, syncLegacyOrderStatus, type OrderContext } from "./order.service";
-import { revalidateDeliveredOrderZones } from "./orderDeliveryZone.service";
 import { syncOrderTrackingFromSegments } from "./segment_tracking.service";
 
 export class OrderStatusError extends Error {
@@ -102,7 +101,6 @@ export async function getOrderStatus(
   const order = await getOrderById(orderId, ctx);
   if (!order) throw new OrderStatusError("Order not found", 404);
 
-  await revalidateDeliveredOrderZones(orderId);
   await syncOrderTrackingFromSegments(orderId);
 
   const histResult = await pool.query(
