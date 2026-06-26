@@ -1,4 +1,5 @@
 import type { TrackingStatus } from "./orderTracking.model";
+import type { SegmentCostStatus } from "./routeCost.model";
 
 export const ROUTE_SELECTION_STATUSES = [
   "pending",
@@ -110,4 +111,7 @@ export interface TransporterConfirmationItem {
   pickup_ready_at: string | null;
   route_segment_count: number;
   previous_leg_status: SegmentLegStatus | null;
+  final_cost: number | null;
+  currency: string;
+  cost_status: SegmentCostStatus;
 }

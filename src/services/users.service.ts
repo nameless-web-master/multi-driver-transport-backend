@@ -10,6 +10,12 @@ export interface ReceiverSummary {
   lng: number | null;
 }
 
+export interface SenderSummary {
+  id: number;
+  full_name: string;
+  email: string;
+}
+
 export interface DriverSummary {
   id: number;
   full_name: string;
@@ -41,6 +47,28 @@ export async function listReceivers(): Promise<ReceiverSummary[]> {
     address: String(row.address ?? ""),
     lat: nullableNumber(row.lat),
     lng: nullableNumber(row.lng),
+  }));
+}
+
+export async function listSenders(query?: string): Promise<SenderSummary[]> {
+  const trimmed = query?.trim() ?? "";
+  if (trimmed.length < 2) {
+    return [];
+  }
+  const params: unknown[] = [`%${trimmed.toLowerCase()}%`];
+  const result = await pool.query(
+    `SELECT id, full_name, email
+     FROM users
+     WHERE role = 'sender' AND is_active = TRUE
+       AND (LOWER(full_name) LIKE $1 OR LOWER(email) LIKE $1)
+     ORDER BY full_name ASC
+     LIMIT 50`,
+    params
+  );
+  return result.rows.map((row) => ({
+    id: Number(row.id),
+    full_name: String(row.full_name),
+    email: String(row.email),
   }));
 }
 

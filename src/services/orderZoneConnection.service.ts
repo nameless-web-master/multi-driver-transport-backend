@@ -10,6 +10,7 @@ import {
   isZoneScheduleActive,
   parseScheduleFromRow,
 } from "./zoneSchedule.service";
+import { getOrderById, OrderError, type OrderContext } from "./order.service";
 
 /**
  * Milestone 2 — Order draft preview.
@@ -1178,4 +1179,39 @@ export async function previewOrderZoneConnectionsByCoordinates(
     possible_connection_chains: chains,
     gap,
   };
+}
+
+/**
+ * Zone-connection preview for an existing order. Uses `getOrderById` access
+ * rules so transporters with a segment on the order can view route geometry
+ * (e.g. quote-request maps) without using the draft-only coordinate endpoint.
+ */
+export async function previewOrderZoneConnectionsForOrder(
+  orderId: number,
+  ctx: OrderContext
+): Promise<OrderDraftPreview> {
+  const order = await getOrderById(orderId, ctx);
+  if (!order) throw new OrderError("Order not found", 404);
+
+  const { sender_lat, sender_lng, destination_lat, destination_lng } = order;
+  if (
+    sender_lat == null ||
+    sender_lng == null ||
+    destination_lat == null ||
+    destination_lng == null
+  ) {
+    throw new OrderError("Order is missing pickup or delivery coordinates", 400);
+  }
+
+  return previewOrderZoneConnectionsByCoordinates({
+    source_lat: sender_lat,
+    source_lng: sender_lng,
+    destination_lat,
+    destination_lng,
+    source_name: order.source_name || order.sender_name,
+    source_address: order.sender_address,
+    destination_name: order.receiver_name,
+    destination_address: order.destination_address,
+    max_depth: DEFAULT_PREVIEW_MAX_DEPTH,
+  });
 }

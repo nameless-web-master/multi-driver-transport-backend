@@ -7,6 +7,7 @@ import {
   TRACKING_STATUSES,
 } from "../models/orderTracking.model";
 import { getOrderById, syncLegacyOrderStatus, type OrderContext } from "./order.service";
+import { notifyOrderParticipants } from "./notification.service";
 import { syncOrderTrackingFromSegments } from "./segment_tracking.service";
 
 export class OrderStatusError extends Error {
@@ -18,6 +19,7 @@ export class OrderStatusError extends Error {
 }
 
 const TRANSITIONS: Record<TrackingStatus, TrackingStatus[]> = {
+  AWAITING_CONNECT: [],
   CONFIRMED: ["PICKUP_AVAILABLE"],
   PICKUP_AVAILABLE: ["PICKED_UP"],
   PICKED_UP: ["IN_TRANSIT"],
@@ -151,6 +153,17 @@ export async function updateOrderStatus(
 
   await assertRouteConfirmed(orderId);
 
+  if (status !== "DELIVERED") {
+    const awaiting = await pool.query(
+      `SELECT tracking_status FROM orders WHERE id = $1`,
+      [orderId]
+    );
+    const ts = awaiting.rows[0]?.tracking_status;
+    if (ts === "AWAITING_CONNECT") {
+      throw new OrderStatusError("Sender must connect this order before updating delivery status", 400);
+    }
+  }
+
   const currentResult = await pool.query(
     `SELECT tracking_status, pickup_ready_at FROM orders WHERE id = $1`,
     [orderId]
@@ -179,6 +192,15 @@ export async function updateOrderStatus(
     );
     await addStatusHistory(orderId, "PICKUP_AVAILABLE", ctx.userId);
     await syncLegacyOrderStatus(orderId, "PICKUP_AVAILABLE");
+
+    void notifyOrderParticipants({
+      order_id: orderId,
+      type: "pickup_ready",
+      title: "Pickup ready",
+      body: `Shipment #${orderId} is ready for pickup. Transporters on the route can begin collection.`,
+      exclude_user_id: ctx.userId,
+    }).catch((err) => console.error("[notifications] pickup_ready failed:", err));
+
     return getOrderStatus(orderId, ctx);
   }
 
@@ -217,6 +239,16 @@ export async function updateOrderStatus(
   );
   await addStatusHistory(orderId, status, ctx.userId);
   await syncLegacyOrderStatus(orderId, status);
+
+  if (status === "DELIVERED") {
+    void notifyOrderParticipants({
+      order_id: orderId,
+      type: "delivered",
+      title: "Shipment delivered",
+      body: `Shipment #${orderId} was marked as delivered.`,
+      exclude_user_id: ctx.userId,
+    }).catch((err) => console.error("[notifications] delivered failed:", err));
+  }
 
   return getOrderStatus(orderId, ctx);
 }

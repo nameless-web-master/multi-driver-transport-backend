@@ -7,6 +7,7 @@ import {
 import type { TrackingStatus } from "../models/orderTracking.model";
 import { isTrackingStatus } from "../models/orderTracking.model";
 import { addStatusHistory } from "./order_status.service";
+import { notifyOrderParticipants } from "./notification.service";
 import { syncLegacyOrderStatus, type OrderContext } from "./order.service";
 
 export class SegmentTrackingError extends Error {
@@ -216,6 +217,15 @@ export async function updateSegmentLegStatus(
   const historyLabel = `SEG${seg.segment_index + 1}:${legStatus}`;
   await addStatusHistory(seg.order_id, historyLabel, ctx.userId);
   await syncOrderTrackingFromSegments(seg.order_id);
+
+  const legLabel = legStatus === "picked_up" ? "picked up" : "in transit";
+  void notifyOrderParticipants({
+    order_id: seg.order_id,
+    type: legStatus === "picked_up" ? "segment_picked_up" : "segment_in_transit",
+    title: `Segment ${legLabel}`,
+    body: `Segment ${seg.segment_index + 1} on shipment #${seg.order_id} was marked ${legLabel}.`,
+    exclude_user_id: ctx.userId,
+  }).catch((err) => console.error("[notifications] segment status failed:", err));
 
   return {
     segment_id: segmentId,

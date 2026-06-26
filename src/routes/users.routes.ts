@@ -1,7 +1,7 @@
 import { Router, Response } from "express";
 import { AuthenticatedRequest, requireAuth } from "../dependencies/auth.middleware";
 import { setOwnerZonesAvailabilitySchema } from "../schemas/driverZone.schema";
-import { listDrivers, listReceivers } from "../services/users.service";
+import { listDrivers, listReceivers, listSenders } from "../services/users.service";
 import { FollowError, followDriver, unfollowDriver } from "../services/follow.service";
 import {
   setOwnerZonesAvailability,
@@ -18,11 +18,30 @@ function ctx(req: AuthenticatedRequest) {
 }
 
 usersRouter.get("/receivers", async (req: AuthenticatedRequest, res: Response) => {
+  const role = req.userRole ?? "sender";
+  if (role !== "admin") {
+    return res.status(403).json({ error: "Receiver directory is not available" });
+  }
   try {
     const receivers = await listReceivers();
     res.json(receivers);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to list receivers";
+    res.status(500).json({ error: message });
+  }
+});
+
+usersRouter.get("/senders", async (req: AuthenticatedRequest, res: Response) => {
+  const role = req.userRole ?? "sender";
+  if (role !== "receiver" && role !== "admin") {
+    return res.status(403).json({ error: "Only receivers can search senders" });
+  }
+  try {
+    const q = typeof req.query.q === "string" ? req.query.q : undefined;
+    const senders = await listSenders(q);
+    res.json(senders);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Failed to list senders";
     res.status(500).json({ error: message });
   }
 });

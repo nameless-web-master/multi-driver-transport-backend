@@ -143,17 +143,35 @@ export interface OrderRouteCostComparisonResponse {
   route_lock_reason: "confirmed_route" | "delivery_in_progress" | null;
 }
 
+export interface AffectedRouteRef {
+  route_id: number;
+  route_label: string;
+}
+
 /** Pending segment cost work for a transporter (quote requested or missing rates). */
 export interface TransporterQuoteRequestItem {
   order_id: number;
   order_status: string;
   sender_address: string;
+  sender_lat: number | null;
+  sender_lng: number | null;
   destination_address: string;
+  destination_lat: number | null;
+  destination_lng: number | null;
   package_type: string | null;
   package_weight_lbs: number | null;
   package_dimensions_in: string | null;
+  /** Driver zone this quote applies to (dedup key with order + transporter). */
+  priced_zone_id: number;
+  /** Primary route used for map geometry (first affected route). */
   route_id: number;
   route_label: string;
+  zone_ids: number[];
+  connection_ids: number[];
+  /** All route alternatives that include this same priced segment. */
+  affected_routes: AffectedRouteRef[];
+  /** All `route_segment_costs` rows updated when a quote is saved. */
+  segment_ids: number[];
   segment: RouteSegmentCostResponse;
   updated_at: string;
 }

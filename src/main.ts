@@ -21,6 +21,7 @@ import { routesCostRouter, routeSegmentCostsRouter } from "./routes/routeCost.ro
 import { routeConfirmationRouter } from "./routes/routeConfirmation.routes";
 import { segmentsRouter } from "./routes/routeConfirmation.routes";
 import { transporterRouter } from "./routes/transporter.routes";
+import { notificationsRouter } from "./routes/notifications.routes";
 
 dotenv.config();
 
@@ -96,6 +97,7 @@ app.use("/api/routes", routeConfirmationRouter);
 app.use("/api/route-segment-costs", routeSegmentCostsRouter);
 app.use("/api/segments", segmentsRouter);
 app.use("/api/transporter", transporterRouter);
+app.use("/api/notifications", notificationsRouter);
 
 // 404
 app.use((req, res) => {

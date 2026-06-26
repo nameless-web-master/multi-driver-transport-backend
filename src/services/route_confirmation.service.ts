@@ -10,6 +10,7 @@ import type {
 } from "../models/routeConfirmation.model";
 import { isSegmentLegStatus } from "../models/routeConfirmation.model";
 import { addStatusHistory } from "./order_status.service";
+import { createUserNotification, notifyOrderParticipants } from "./notification.service";
 import { getOrderById, type OrderContext } from "./order.service";
 import { isOrderRouteLocked } from "./orderRouteLock.service";
 import {
@@ -188,6 +189,17 @@ export async function sendConfirmationToTransporters(
   } finally {
     client.release();
   }
+
+  for (const seg of segments) {
+    const transporterId = Number(seg.transporter_id);
+    void createUserNotification({
+      user_id: transporterId,
+      order_id: orderId,
+      type: "confirmation_request",
+      title: "Route confirmation requested",
+      body: `You have a new segment confirmation request for shipment #${orderId}. Review and accept or reject in your workspace.`,
+    }).catch((err) => console.error("[notifications] confirmation_request failed:", err));
+  }
 }
 
 async function assertSegmentTransporter(segmentId: number, transporterId: number) {
@@ -268,6 +280,16 @@ export async function rejectSegment(
      WHERE r.id = $1 AND rs.selected_route_id = r.id AND rs.order_id = r.order_id`,
     [routeId]
   );
+
+  const orderId = Number(seg.order_id);
+  const reasonText = reason?.trim() ? ` Reason: ${reason.trim()}` : "";
+  void notifyOrderParticipants({
+    order_id: orderId,
+    type: "segment_rejected",
+    title: "Segment rejected",
+    body: `A transporter rejected a segment on shipment #${orderId}.${reasonText}`,
+    exclude_user_id: ctx.userId,
+  }).catch((err) => console.error("[notifications] segment_rejected failed:", err));
 
   return getRouteConfirmationStatus(routeId, ctx);
 }
@@ -378,7 +400,14 @@ export async function finalizeRouteIfAllConfirmed(routeId: number): Promise<void
       [routeId]
     );
     if (orderResult.rowCount) {
-      await addStatusHistory(Number(orderResult.rows[0].order_id), "CONFIRMED", null);
+      const orderId = Number(orderResult.rows[0].order_id);
+      await addStatusHistory(orderId, "CONFIRMED", null);
+      void notifyOrderParticipants({
+        order_id: orderId,
+        type: "route_confirmed",
+        title: "Route fully confirmed",
+        body: `All transporters confirmed their segments for shipment #${orderId}. Pickup can be scheduled when ready.`,
+      }).catch((err) => console.error("[notifications] route_confirmed failed:", err));
     }
   }
 }
@@ -508,6 +537,9 @@ export async function listTransporterConfirmations(
         : row.previous_leg_status == null
           ? null
           : "not_started",
+      final_cost: seg?.final_cost ?? null,
+      currency: seg?.currency ?? "CAD",
+      cost_status: seg?.cost_status ?? "missing",
     });
   }
 

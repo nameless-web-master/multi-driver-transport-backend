@@ -23,8 +23,10 @@ function isRouteSelectionStatus(value: unknown): value is RouteSelectionStatus {
   );
 }
 import type { UserRole } from "../models/userRole.model";
+import { notifyOrderParticipants, notifyUsers } from "./notification.service";
 import {
   CreateOrderRequest,
+  CreateReceiverOrderRequest,
   UpdateOrderPackageRequest,
   UpdateOrderStatusRequest,
 } from "../schemas/order.schema";
@@ -248,8 +250,8 @@ export async function createOrder(
   ctx: OrderContext,
   data: CreateOrderRequest
 ): Promise<OrderResponse> {
-  if (ctx.role !== "sender" && ctx.role !== "admin") {
-    throw new OrderError("Only senders can create orders", 403);
+  if (ctx.role !== "admin") {
+    throw new OrderError("Orders are created by receivers. Senders connect incoming requests.", 403);
   }
 
   const receiver = await pool.query(
@@ -368,6 +370,187 @@ export async function createOrder(
   return created;
 }
 
+export async function createOrderByReceiver(
+  ctx: OrderContext,
+  data: CreateReceiverOrderRequest
+): Promise<OrderResponse> {
+  if (ctx.role !== "receiver") {
+    throw new OrderError("Only receivers can submit shipment requests", 403);
+  }
+
+  const sender = await pool.query(
+    `SELECT id, role, full_name, phone, address, lat, lng FROM users WHERE id = $1`,
+    [data.sender_user_id]
+  );
+  if (sender.rowCount === 0) throw new OrderError("Sender not found", 404);
+  const s = sender.rows[0];
+  if (s.role !== "sender") {
+    throw new OrderError("Selected user is not a sender", 400);
+  }
+
+  const receiverRow = await pool.query(
+    `SELECT full_name, phone, address FROM users WHERE id = $1`,
+    [ctx.userId]
+  );
+  const r = receiverRow.rows[0] ?? {};
+
+  const senderBillingAddress = String(s.address ?? "");
+  const pickupAddress = senderBillingAddress;
+  const senderLat = toNullable(s.lat);
+  const senderLng = toNullable(s.lng);
+  if (senderLat == null || senderLng == null) {
+    throw new OrderError(
+      "Selected sender has no pickup coordinates on file. They must update their profile before you can submit this request.",
+      400
+    );
+  }
+
+  const receiverBillingAddress =
+    data.receiver_billing_address?.trim() || String(r.address ?? "");
+  const deliveryAddress = data.destination_address.trim();
+  const destinationLat = data.destination_lat;
+  const destinationLng = data.destination_lng;
+
+  const pickupH3 = coordsToH3(senderLat, senderLng, ORDER_H3_RESOLUTION);
+  const deliveryH3 = coordsToH3(destinationLat, destinationLng, ORDER_H3_RESOLUTION);
+
+  const packages: OrderPackageEntry[] = normalizeOrderPackages(
+    data.packages,
+    data.package_type ?? null,
+    {
+      weight_lbs: data.weight_lbs,
+      package_length: data.package_length,
+      package_width: data.package_width,
+      package_height: data.package_height,
+    }
+  );
+  if (packages.length > MAX_PACKAGES) {
+    throw new OrderError(`At most ${MAX_PACKAGES} packages are allowed`, 400);
+  }
+  const packageType: PackageType = packages[0].package_type;
+  const packageFactor = totalPackageFactorForEntries(packages);
+  const rolledUp = rollupOrderTotalsFromPackages(packages);
+  const weightLbs = rolledUp.weight_lbs;
+  const packageLength = rolledUp.package_length;
+  const packageWidth = rolledUp.package_width;
+  const packageHeight = rolledUp.package_height;
+  const dimensionsText = data.dimensions?.trim() || rolledUp.dimensions;
+
+  const insert = await pool.query(
+    `INSERT INTO orders
+       (sender_user_id, receiver_user_id, driver_user_id,
+        sender_address, sender_billing_address, sender_lat, sender_lng,
+        destination_address, receiver_billing_address, destination_lat, destination_lng,
+        receiver_phone, notes,
+        pickup_h3, delivery_h3, h3_resolution,
+        source_name, source_contact, payment_method, shipping_method,
+        package_description, package_type, packages, package_factor,
+        weight_kg, weight_lbs, package_weight_unit,
+        package_length, package_width, package_height, package_dimension_unit,
+        dimensions,
+        status, tracking_status, submitted_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+             $14, $15, $16, $17, $18, $19, $20, $21, $22,
+             $23, $24, $25, $26, $27, $28, $29, $30, $31, $32,
+             'submitted', 'AWAITING_CONNECT', NOW())
+     RETURNING id`,
+    [
+      data.sender_user_id,
+      ctx.userId,
+      null,
+      pickupAddress,
+      senderBillingAddress,
+      senderLat,
+      senderLng,
+      deliveryAddress,
+      receiverBillingAddress,
+      destinationLat,
+      destinationLng,
+      String(r.phone ?? ""),
+      data.notes ?? "",
+      pickupH3,
+      deliveryH3,
+      ORDER_H3_RESOLUTION,
+      String(s.full_name ?? ""),
+      String(s.phone ?? ""),
+      data.payment_method ?? "",
+      data.shipping_method ?? "",
+      data.package_description ?? "",
+      packageType,
+      JSON.stringify(packages),
+      packageFactor,
+      weightLbs,
+      weightLbs,
+      "lb",
+      packageLength,
+      packageWidth,
+      packageHeight,
+      "in",
+      dimensionsText,
+    ]
+  );
+
+  const orderId = Number(insert.rows[0].id);
+  await pool.query(
+    `INSERT INTO order_status_history (order_id, status, updated_by) VALUES ($1, $2, $3)`,
+    [orderId, "AWAITING_CONNECT", ctx.userId]
+  );
+
+  const created = await getOrderById(orderId, ctx);
+  if (!created) throw new OrderError("Failed to load freshly created order", 500);
+
+  void notifyUsers({
+    user_ids: [data.sender_user_id],
+    order_id: orderId,
+    type: "order_request",
+    title: "New shipment request",
+    body: `${String(r.full_name ?? "A receiver")} submitted a shipment request to ${deliveryAddress}. Connect to build routes.`,
+    exclude_user_id: ctx.userId,
+  }).catch((err) => console.error("[notifications] order_request failed:", err));
+
+  return created;
+}
+
+export async function connectOrderAsSender(
+  orderId: number,
+  ctx: OrderContext
+): Promise<OrderResponse> {
+  if (ctx.role !== "sender" && ctx.role !== "admin") {
+    throw new OrderError("Only senders can connect shipment requests", 403);
+  }
+
+  const existing = await getOrderById(orderId, ctx);
+  if (!existing) throw new OrderError("Order not found", 404);
+  if (ctx.role === "sender" && existing.sender_user_id !== ctx.userId) {
+    throw new OrderError("Forbidden", 403);
+  }
+  if (existing.tracking_status !== "AWAITING_CONNECT") {
+    throw new OrderError("This order is already connected", 400);
+  }
+
+  await pool.query(
+    `UPDATE orders SET tracking_status = 'CONFIRMED', updated_at = NOW() WHERE id = $1`,
+    [orderId]
+  );
+  await pool.query(
+    `INSERT INTO order_status_history (order_id, status, updated_by) VALUES ($1, $2, $3)`,
+    [orderId, "CONFIRMED", ctx.userId]
+  );
+
+  const refreshed = await getOrderById(orderId, ctx);
+  if (!refreshed) throw new OrderError("Failed to load order", 500);
+
+  void notifyOrderParticipants({
+    order_id: orderId,
+    type: "order_connected",
+    title: "Shipment connected",
+    body: `Shipment #${orderId} was connected. Route options can now be compared and confirmations sent.`,
+    exclude_user_id: ctx.userId,
+  }).catch((err) => console.error("[notifications] order_connected failed:", err));
+
+  return refreshed;
+}
+
 export async function listOrders(ctx: OrderContext): Promise<OrderResponse[]> {
   const params: unknown[] = [];
   let where = "";
@@ -474,6 +657,9 @@ export async function updateOrderPackage(
 
   const existing = await getOrderById(id, ctx);
   if (!existing) throw new OrderError("Order not found", 404);
+  if (existing.tracking_status === "AWAITING_CONNECT") {
+    throw new OrderError("Package details can only be edited after the sender connects the order", 400);
+  }
   if (existing.status !== "submitted") {
     throw new OrderError("Package details can only be edited while the order is submitted", 400);
   }

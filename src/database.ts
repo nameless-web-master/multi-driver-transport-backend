@@ -715,7 +715,7 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_tracking_status_check;`);
     await client.query(
       `ALTER TABLE orders ADD CONSTRAINT orders_tracking_status_check
-         CHECK (tracking_status IN ('CONFIRMED', 'PICKUP_AVAILABLE', 'PICKED_UP', 'IN_TRANSIT', 'DELIVERED'));`
+         CHECK (tracking_status IN ('AWAITING_CONNECT', 'CONFIRMED', 'PICKUP_AVAILABLE', 'PICKED_UP', 'IN_TRANSIT', 'DELIVERED'));`
     );
     // Reset rows that inherited the old PICKUP_AVAILABLE default before pick ready / delivery.
     await client.query(
@@ -750,6 +750,27 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`CREATE INDEX IF NOT EXISTS idx_order_status_history_order ON order_status_history (order_id);`);
     await client.query(
       `ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_ready_at TIMESTAMPTZ;`
+    );
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS user_notifications (
+        id         SERIAL PRIMARY KEY,
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        order_id   INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+        type       TEXT NOT NULL,
+        title      TEXT NOT NULL,
+        body       TEXT NOT NULL,
+        read_at    TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_user_notifications_user_created
+       ON user_notifications (user_id, created_at DESC);`
+    );
+    await client.query(
+      `CREATE INDEX IF NOT EXISTS idx_user_notifications_unread
+       ON user_notifications (user_id) WHERE read_at IS NULL;`
     );
 
     console.log("[db] schema ready");

@@ -4,12 +4,15 @@ import { AuthenticatedRequest, requireAuth } from "../dependencies/auth.middlewa
 import { latitudeSchema, longitudeSchema } from "../schemas/h3.schema";
 import {
   createOrderSchema,
+  createReceiverOrderSchema,
   updateOrderPackageSchema,
   updateOrderStatusSchema,
 } from "../schemas/order.schema";
 import {
   OrderError,
+  connectOrderAsSender,
   createOrder,
+  createOrderByReceiver,
   getOrderById,
   listOrders,
   updateOrderPackage,
@@ -18,6 +21,7 @@ import {
 import {
   DEFAULT_PREVIEW_MAX_DEPTH,
   previewOrderZoneConnectionsByCoordinates,
+  previewOrderZoneConnectionsForOrder,
 } from "../services/orderZoneConnection.service";
 import {
   RouteCostError,
@@ -150,6 +154,19 @@ ordersRouter.get("/:id/selected-route", async (req: AuthenticatedRequest, res: R
   }
 });
 
+ordersRouter.get("/:id/zone-connection-preview", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  try {
+    const preview = await previewOrderZoneConnectionsForOrder(id, ctx(req));
+    res.json(preview);
+  } catch (err) {
+    handle(res, err);
+  }
+});
+
 ordersRouter.get("/:id/sender-view", async (req: AuthenticatedRequest, res: Response) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id < 1) {
@@ -266,20 +283,67 @@ ordersRouter.get("/:id", async (req: AuthenticatedRequest, res: Response) => {
   }
 });
 
-ordersRouter.post("/", async (req: AuthenticatedRequest, res: Response) => {
-  const parsed = createOrderSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({
-      error: "Validation failed",
-      details: parsed.error.flatten().fieldErrors,
-    });
+ordersRouter.post("/:id/connect", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
   }
+  const c = ctx(req);
   try {
-    const order = await createOrder(ctx(req), parsed.data);
-    res.status(201).json(order);
+    await connectOrderAsSender(id, c);
+    let routeRecalcWarning: string | null = null;
+    try {
+      await recalculateRouteCostsForOrder(id, c);
+    } catch (recalcErr) {
+      routeRecalcWarning =
+        recalcErr instanceof RouteCostError
+          ? recalcErr.message
+          : recalcErr instanceof Error
+            ? recalcErr.message
+            : "Route calculation failed after connect";
+      console.warn("[orders] connected but route cost recalc failed:", recalcErr);
+    }
+    const order = await getOrderById(id, c);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    res.json({ ...order, route_recalc_warning: routeRecalcWarning });
   } catch (err) {
     handle(res, err);
   }
+});
+
+ordersRouter.post("/", async (req: AuthenticatedRequest, res: Response) => {
+  const c = ctx(req);
+  if (c.role === "receiver") {
+    const parsed = createReceiverOrderSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: "Validation failed",
+        details: parsed.error.flatten().fieldErrors,
+      });
+    }
+    try {
+      const order = await createOrderByReceiver(c, parsed.data);
+      return res.status(201).json(order);
+    } catch (err) {
+      return handle(res, err);
+    }
+  }
+  if (c.role === "admin") {
+    const parsed = createOrderSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: "Validation failed",
+        details: parsed.error.flatten().fieldErrors,
+      });
+    }
+    try {
+      const order = await createOrder(c, parsed.data);
+      return res.status(201).json(order);
+    } catch (err) {
+      return handle(res, err);
+    }
+  }
+  return res.status(403).json({ error: "Only receivers can submit shipment requests" });
 });
 
 ordersRouter.patch("/:id/package", async (req: AuthenticatedRequest, res: Response) => {

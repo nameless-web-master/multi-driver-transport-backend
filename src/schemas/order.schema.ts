@@ -38,6 +38,34 @@ function resolvePackagesInput(data: {
   });
 }
 
+export const createReceiverOrderSchema = z.object({
+  sender_user_id: z.number().int().positive(),
+  destination_address: z.string().trim().min(1).max(300),
+  destination_lat: latitudeSchema,
+  destination_lng: longitudeSchema,
+  receiver_billing_address: z.string().trim().max(300).optional().default(""),
+  notes: z.string().trim().max(1000).optional().default(""),
+  payment_method: z.string().trim().max(60).optional().default(""),
+  shipping_method: z.string().trim().max(60).optional().default(""),
+  package_description: z.string().trim().max(1000).optional().default(""),
+  package_type: packageTypeSchema.optional(),
+  packages: z.array(orderPackageEntrySchema).min(1).max(MAX_PACKAGES).optional(),
+  weight_lbs: positivePackageNumber("weight_lbs").optional().nullable(),
+  package_length: positivePackageNumber("package_length").optional().nullable(),
+  package_width: positivePackageNumber("package_width").optional().nullable(),
+  package_height: positivePackageNumber("package_height").optional().nullable(),
+  dimensions: z.string().trim().max(500).optional().default(""),
+}).superRefine((data, ctx) => {
+  const packages = resolvePackagesInput(data);
+  if (packages.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["packages"],
+      message: "Provide at least one package with type, weight, and dimensions",
+    });
+  }
+});
+
 export const createOrderSchema = z.object({
   receiver_user_id: z.number().int().positive(),
   sender_address: z.string().trim().max(300).optional().default(""),
@@ -141,6 +169,7 @@ export const updateOrderPackageSchema = z
     }
   });
 
+export type CreateReceiverOrderRequest = z.infer<typeof createReceiverOrderSchema>;
 export type CreateOrderRequest = z.infer<typeof createOrderSchema>;
 export type UpdateOrderStatusRequest = z.infer<typeof updateOrderStatusSchema>;
 export type UpdateOrderPackageRequest = z.infer<typeof updateOrderPackageSchema>;
