@@ -40,7 +40,10 @@ function parseQuotedCost(body: unknown): ExternalQuoteResponse {
   const record = body as Record<string, unknown>;
   const cost = Number(record.quoted_cost);
   if (!Number.isFinite(cost) || cost < 0) {
-    throw new ExternalQuoteError("Quote API response missing valid quoted_cost", 502);
+    throw new ExternalQuoteError(
+      "Quote API response missing valid quoted_cost",
+      502,
+    );
   }
   const currency =
     typeof record.currency === "string" && record.currency.trim()
@@ -50,13 +53,13 @@ function parseQuotedCost(body: unknown): ExternalQuoteResponse {
 }
 
 export async function fetchExternalQuote(
-  payload: ExternalQuoteRequest
+  payload: ExternalQuoteRequest,
 ): Promise<ExternalQuoteResponse> {
   const url = process.env.EXTERNAL_QUOTE_WEBHOOK_URL?.trim();
   if (!url) {
     throw new ExternalQuoteError(
       "External quote webhook is not configured (EXTERNAL_QUOTE_WEBHOOK_URL)",
-      503
+      503,
     );
   }
 
@@ -67,7 +70,9 @@ export async function fetchExternalQuote(
   };
 
   const apiKey = process.env.EXTERNAL_QUOTE_API_KEY?.trim();
-  const authHeader = (process.env.EXTERNAL_QUOTE_AUTH_HEADER ?? "Authorization").trim();
+  const authHeader = (
+    process.env.EXTERNAL_QUOTE_AUTH_HEADER ?? "Authorization"
+  ).trim();
   if (apiKey) {
     if (authHeader.toLowerCase() === "authorization") {
       headers.Authorization = `Bearer ${apiKey}`;
@@ -111,7 +116,8 @@ export async function fetchExternalQuote(
     if (err instanceof Error && err.name === "AbortError") {
       throw new ExternalQuoteError("Quote API request timed out", 504);
     }
-    const message = err instanceof Error ? err.message : "Quote API request failed";
+    const message =
+      err instanceof Error ? err.message : "Quote API request failed";
     throw new ExternalQuoteError(message, 502);
   } finally {
     clearTimeout(timer);
