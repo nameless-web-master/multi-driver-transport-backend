@@ -11,7 +11,10 @@ import type {
   TransporterQuoteRequestItem,
   AffectedRouteRef,
 } from "../models/routeCost.model";
-import { segmentNeedsCostEntry, segmentNeedsRecalculation } from "../models/routeCost.model";
+import {
+  segmentNeedsCostEntry,
+  segmentNeedsRecalculation,
+} from "../models/routeCost.model";
 import { getBookingFeeRate, getLandSpeedKmh } from "./pricingConfig.service";
 import {
   loadRegionsByIds,
@@ -40,7 +43,10 @@ import {
   isExternalQuoteConfigured,
   type ExternalQuoteRequest,
 } from "./externalQuote.service";
-import { getOrderRouteLockInfo, isOrderRouteLocked } from "./orderRouteLock.service";
+import {
+  getOrderRouteLockInfo,
+  isOrderRouteLocked,
+} from "./orderRouteLock.service";
 
 export class RouteCostError extends Error {
   status: number;
@@ -51,7 +57,8 @@ export class RouteCostError extends Error {
 }
 
 function parseJsonIntArray(raw: unknown): number[] {
-  if (Array.isArray(raw)) return raw.map((v) => Number(v)).filter((n) => Number.isFinite(n));
+  if (Array.isArray(raw))
+    return raw.map((v) => Number(v)).filter((n) => Number.isFinite(n));
   if (typeof raw === "string") {
     try {
       return parseJsonIntArray(JSON.parse(raw));
@@ -76,15 +83,18 @@ type RouteChain = { zone_ids: number[]; connection_ids: number[] };
 /** Serialize route re-sync for one order so concurrent callers don't race on DELETE/INSERT. */
 const orderResyncQueues = new Map<number, Promise<unknown>>();
 
-async function withOrderResyncLock<T>(orderId: number, fn: () => Promise<T>): Promise<T> {
+async function withOrderResyncLock<T>(
+  orderId: number,
+  fn: () => Promise<T>,
+): Promise<T> {
   const prev = orderResyncQueues.get(orderId) ?? Promise.resolve();
   const run = prev.then(fn, fn);
   orderResyncQueues.set(
     orderId,
     run.then(
       () => undefined,
-      () => undefined
-    )
+      () => undefined,
+    ),
   );
   return run;
 }
@@ -93,7 +103,10 @@ function chainSignature(chain: RouteChain): string {
   return `${chain.zone_ids.join(",")}|${chain.connection_ids.join(",")}`;
 }
 
-function storedRouteSignature(route: { zone_ids: unknown; connection_ids: unknown }): string {
+function storedRouteSignature(route: {
+  zone_ids: unknown;
+  connection_ids: unknown;
+}): string {
   return chainSignature({
     zone_ids: parseJsonIntArray(route.zone_ids),
     connection_ids: parseJsonIntArray(route.connection_ids),
@@ -102,7 +115,7 @@ function storedRouteSignature(route: { zone_ids: unknown; connection_ids: unknow
 
 function routeChainsMatch(
   live: RouteChain[],
-  stored: Array<{ zone_ids: unknown; connection_ids: unknown }>
+  stored: Array<{ zone_ids: unknown; connection_ids: unknown }>,
 ): boolean {
   if (live.length !== stored.length) return false;
   const liveSigs = live.map(chainSignature).sort();
@@ -110,7 +123,9 @@ function routeChainsMatch(
   return liveSigs.every((sig, i) => sig === storedSigs[i]);
 }
 
-async function fetchLiveRouteChains(order: OrderResponse): Promise<RouteChain[]> {
+async function fetchLiveRouteChains(
+  order: OrderResponse,
+): Promise<RouteChain[]> {
   if (
     order.sender_lat == null ||
     order.sender_lng == null ||
@@ -135,10 +150,13 @@ async function fetchLiveRouteChains(order: OrderResponse): Promise<RouteChain[]>
   return preview.possible_connection_chains;
 }
 
-async function orderRoutesNeedResync(order: OrderResponse, liveChains: RouteChain[]): Promise<boolean> {
+async function orderRoutesNeedResync(
+  order: OrderResponse,
+  liveChains: RouteChain[],
+): Promise<boolean> {
   const stored = await pool.query(
     `SELECT zone_ids, connection_ids FROM order_routes WHERE order_id = $1 ORDER BY route_index`,
-    [order.id]
+    [order.id],
   );
   if (stored.rowCount === 0) return true;
   return !routeChainsMatch(liveChains, stored.rows);
@@ -149,13 +167,15 @@ async function orderRoutesNeedResync(order: OrderResponse, liveChains: RouteChai
  * `${zoneSignature}::${segment_index}`, so a recalculation can re-apply them
  * even though the underlying route/segment rows are recreated.
  */
-async function snapshotManualCosts(orderId: number): Promise<Map<string, number>> {
+async function snapshotManualCosts(
+  orderId: number,
+): Promise<Map<string, number>> {
   const result = await pool.query(
     `SELECT r.zone_ids, sc.segment_index, sc.manual_cost
      FROM route_segment_costs sc
      JOIN order_routes r ON r.id = sc.route_id
      WHERE r.order_id = $1 AND sc.cost_status = 'manual' AND sc.manual_cost IS NOT NULL`,
-    [orderId]
+    [orderId],
   );
   const map = new Map<string, number>();
   for (const row of result.rows) {
@@ -165,9 +185,7 @@ async function snapshotManualCosts(orderId: number): Promise<Map<string, number>
   return map;
 }
 
-async function loadZoneMetaForIds(
-  zoneIds: number[]
-): Promise<
+async function loadZoneMetaForIds(zoneIds: number[]): Promise<
   Map<
     number,
     {
@@ -185,7 +203,7 @@ async function loadZoneMetaForIds(
     `SELECT id, owner_user_id, transport_mode, zone_name, resolution,
             departure_time, arrival_time
      FROM driver_zones WHERE id = ANY($1::int[])`,
-    [zoneIds]
+    [zoneIds],
   );
   const map = new Map<
     number,
@@ -201,13 +219,15 @@ async function loadZoneMetaForIds(
   for (const row of result.rows) {
     map.set(Number(row.id), {
       owner_user_id: Number(row.owner_user_id),
-      transport_mode: row.transport_mode == null ? null : String(row.transport_mode),
+      transport_mode:
+        row.transport_mode == null ? null : String(row.transport_mode),
       zone_name: String(row.zone_name ?? ""),
       resolution:
         row.resolution == null || !Number.isFinite(Number(row.resolution))
           ? null
           : Number(row.resolution),
-      departure_time: row.departure_time == null ? null : String(row.departure_time),
+      departure_time:
+        row.departure_time == null ? null : String(row.departure_time),
       arrival_time: row.arrival_time == null ? null : String(row.arrival_time),
     });
   }
@@ -215,8 +235,10 @@ async function loadZoneMetaForIds(
 }
 
 async function loadZoneCentroids(
-  zoneIds: number[]
-): Promise<Map<number, { lat: number; lng: number; transport_method: string | null }>> {
+  zoneIds: number[],
+): Promise<
+  Map<number, { lat: number; lng: number; transport_method: string | null }>
+> {
   if (zoneIds.length === 0) return new Map();
   const result = await pool.query(
     `SELECT z.id, z.transport_mode,
@@ -226,9 +248,12 @@ async function loadZoneCentroids(
             ) AS sample_cell
      FROM driver_zones z
      WHERE z.id = ANY($1::int[])`,
-    [zoneIds]
+    [zoneIds],
   );
-  const map = new Map<number, { lat: number; lng: number; transport_method: string | null }>();
+  const map = new Map<
+    number,
+    { lat: number; lng: number; transport_method: string | null }
+  >();
   for (const row of result.rows) {
     const cell = row.sample_cell != null ? String(row.sample_cell) : null;
     if (!cell) continue;
@@ -237,7 +262,8 @@ async function loadZoneCentroids(
       map.set(Number(row.id), {
         lat,
         lng,
-        transport_method: row.transport_mode == null ? null : String(row.transport_mode),
+        transport_method:
+          row.transport_mode == null ? null : String(row.transport_mode),
       });
     } catch {
       /* skip */
@@ -289,7 +315,11 @@ function pricedZoneIdForSegment(row: {
   return null;
 }
 
-function quoteDedupKey(orderId: number, transporterId: number, pricedZoneId: number): string {
+function quoteDedupKey(
+  orderId: number,
+  transporterId: number,
+  pricedZoneId: number,
+): string {
   return `${orderId}:${transporterId}:${pricedZoneId}`;
 }
 
@@ -298,9 +328,15 @@ async function findSiblingSegmentRows(
   orderId: number,
   transporterId: number,
   pricedZoneId: number,
-  statuses: SegmentCostStatus[] = ["requested", "missing"]
+  statuses: SegmentCostStatus[] = ["requested", "missing"],
 ): Promise<
-  Array<Record<string, unknown> & { route_id: number; route_label: string; zone_ids: unknown }>
+  Array<
+    Record<string, unknown> & {
+      route_id: number;
+      route_label: string;
+      zone_ids: unknown;
+    }
+  >
 > {
   const result = await pool.query(
     `SELECT sc.*, r.id AS route_id, r.route_label, r.zone_ids, r.connection_ids, r.order_id
@@ -309,15 +345,23 @@ async function findSiblingSegmentRows(
      WHERE r.order_id = $1
        AND sc.transporter_id = $2
        AND sc.cost_status = ANY($3::text[])`,
-    [orderId, transporterId, statuses]
+    [orderId, transporterId, statuses],
   );
   return result.rows.filter((row) => {
     const zid = pricedZoneIdForSegment(row);
     return zid === pricedZoneId;
-  }) as Array<Record<string, unknown> & { route_id: number; route_label: string; zone_ids: unknown }>;
+  }) as Array<
+    Record<string, unknown> & {
+      route_id: number;
+      route_label: string;
+      zone_ids: unknown;
+    }
+  >;
 }
 
-async function recalculateRouteSummaries(routeIds: Iterable<number>): Promise<void> {
+async function recalculateRouteSummaries(
+  routeIds: Iterable<number>,
+): Promise<void> {
   const seen = new Set<number>();
   for (const routeId of routeIds) {
     if (seen.has(routeId)) continue;
@@ -326,7 +370,9 @@ async function recalculateRouteSummaries(routeIds: Iterable<number>): Promise<vo
   }
 }
 
-async function loadZonePricing(zoneIds: number[]): Promise<Map<number, ZonePricingEntry>> {
+async function loadZonePricing(
+  zoneIds: number[],
+): Promise<Map<number, ZonePricingEntry>> {
   if (zoneIds.length === 0) return new Map();
   const result = await pool.query(
     `SELECT dz.id, dz.currency, dz.pricing_mode, dz.pricing_region_id,
@@ -335,7 +381,7 @@ async function loadZonePricing(zoneIds: number[]): Promise<Map<number, ZonePrici
      FROM driver_zones dz
      LEFT JOIN pricing_regions pr ON pr.id = dz.pricing_region_id
      WHERE dz.id = ANY($1::int[])`,
-    [zoneIds]
+    [zoneIds],
   );
   const num = (v: unknown): number | null =>
     v == null || !Number.isFinite(Number(v)) ? null : Number(v);
@@ -343,8 +389,10 @@ async function loadZonePricing(zoneIds: number[]): Promise<Map<number, ZonePrici
   const regionIds = [
     ...new Set(
       result.rows
-        .map((r) => (r.pricing_region_id == null ? null : Number(r.pricing_region_id)))
-        .filter((id): id is number => id != null)
+        .map((r) =>
+          r.pricing_region_id == null ? null : Number(r.pricing_region_id),
+        )
+        .filter((id): id is number => id != null),
     ),
   ];
   const regions = await loadRegionsByIds(regionIds);
@@ -362,7 +410,7 @@ async function loadZonePricing(zoneIds: number[]): Promise<Map<number, ZonePrici
         cost_per_hour: num(row.cost_per_hour),
         currency: String(row.currency ?? "CAD"),
       },
-      regionId != null ? regions.get(regionId) ?? null : null
+      regionId != null ? (regions.get(regionId) ?? null) : null,
     );
     const rate: SegmentRate = {
       currency: merged.currency,
@@ -374,7 +422,9 @@ async function loadZonePricing(zoneIds: number[]): Promise<Map<number, ZonePrici
     map.set(Number(row.id), {
       pricing_mode: pricingMode,
       pricing_region_name:
-        row.pricing_region_name == null ? null : String(row.pricing_region_name),
+        row.pricing_region_name == null
+          ? null
+          : String(row.pricing_region_name),
       effective_base_fee: merged.base_fee,
       effective_cost_per_km: merged.cost_per_km,
       effective_cost_per_hour: merged.cost_per_hour,
@@ -389,13 +439,15 @@ async function loadZonePricing(zoneIds: number[]): Promise<Map<number, ZonePrici
  * great-circle distance (km) between each such zone's departure and arrival
  * hubs so the segment can be priced per km.
  */
-async function loadZoneLineDistances(zoneIds: number[]): Promise<Map<number, number>> {
+async function loadZoneLineDistances(
+  zoneIds: number[],
+): Promise<Map<number, number>> {
   if (zoneIds.length === 0) return new Map();
   const result = await pool.query(
     `SELECT id, transport_mode,
             departure_hub_lat, departure_hub_lng, arrival_hub_lat, arrival_hub_lng
      FROM driver_zones WHERE id = ANY($1::int[])`,
-    [zoneIds]
+    [zoneIds],
   );
   const map = new Map<number, number>();
   for (const row of result.rows) {
@@ -405,7 +457,7 @@ async function loadZoneLineDistances(zoneIds: number[]): Promise<Map<number, num
       row.departure_hub_lat == null ? null : Number(row.departure_hub_lat),
       row.departure_hub_lng == null ? null : Number(row.departure_hub_lng),
       row.arrival_hub_lat == null ? null : Number(row.arrival_hub_lat),
-      row.arrival_hub_lng == null ? null : Number(row.arrival_hub_lng)
+      row.arrival_hub_lng == null ? null : Number(row.arrival_hub_lng),
     );
     if (km != null) map.set(Number(row.id), km);
   }
@@ -444,13 +496,21 @@ function transferPointFromCells(cells: string[]): LatLng | null {
  * the entry/exit points used to count cells traversed within a land zone.
  */
 async function loadConnectionsByIds(
-  ids: number[]
-): Promise<Map<number, { zone_a_id: number; zone_b_id: number; transfer_cells: string[] }>> {
-  const map = new Map<number, { zone_a_id: number; zone_b_id: number; transfer_cells: string[] }>();
+  ids: number[],
+): Promise<
+  Map<
+    number,
+    { zone_a_id: number; zone_b_id: number; transfer_cells: string[] }
+  >
+> {
+  const map = new Map<
+    number,
+    { zone_a_id: number; zone_b_id: number; transfer_cells: string[] }
+  >();
   if (ids.length === 0) return map;
   const result = await pool.query(
     `SELECT id, zone_a_id, zone_b_id, transfer_cells FROM zone_connections WHERE id = ANY($1::int[])`,
-    [ids]
+    [ids],
   );
   for (const row of result.rows) {
     let cells: string[] = [];
@@ -481,15 +541,25 @@ async function computeSegmentDistances(
   zoneIds: number[],
   connectionIds: number[],
   order: OrderResponse,
-  zoneMeta: Map<number, { transport_mode: string | null; resolution: number | null }>,
+  zoneMeta: Map<
+    number,
+    { transport_mode: string | null; resolution: number | null }
+  >,
   zoneCoords: Map<number, { lat: number; lng: number }>,
   zoneLineKm: Map<number, number>,
-  connectionsById: Map<number, { zone_a_id: number; zone_b_id: number; transfer_cells: string[] }>,
-  segments: DerivedSegment[]
+  connectionsById: Map<
+    number,
+    { zone_a_id: number; zone_b_id: number; transfer_cells: string[] }
+  >,
+  segments: DerivedSegment[],
 ): Promise<
   Map<
     number,
-    { distance_h3_cells: number | null; distance_km: number | null; duration_hours: number | null }
+    {
+      distance_h3_cells: number | null;
+      distance_km: number | null;
+      duration_hours: number | null;
+    }
   >
 > {
   const transferAt = (i: number): LatLng | null => {
@@ -515,18 +585,26 @@ async function computeSegmentDistances(
       ? { lat: order.destination_lat, lng: order.destination_lng }
       : null;
 
-  const perZone = new Map<number, { cells: number | null; km: number | null; hours: number | null }>();
+  const perZone = new Map<
+    number,
+    { cells: number | null; km: number | null; hours: number | null }
+  >();
   for (let i = 0; i < zoneIds.length; i++) {
     const zoneId = zoneIds[i];
     const meta = zoneMeta.get(zoneId);
     const mode = meta?.transport_mode ?? "land";
     if (mode === "air" || mode === "sea") {
-      perZone.set(zoneId, { cells: null, km: zoneLineKm.get(zoneId) ?? null, hours: null });
+      perZone.set(zoneId, {
+        cells: null,
+        km: zoneLineKm.get(zoneId) ?? null,
+        hours: null,
+      });
       continue;
     }
     const centroid = zoneCoords.get(zoneId) ?? null;
     const entry = (i === 0 ? sender : transferAt(i - 1)) ?? centroid;
-    const exit = (i === zoneIds.length - 1 ? receiver : transferAt(i)) ?? centroid;
+    const exit =
+      (i === zoneIds.length - 1 ? receiver : transferAt(i)) ?? centroid;
     if (!entry || !exit) {
       perZone.set(zoneId, { cells: null, km: null, hours: null });
       continue;
@@ -536,7 +614,7 @@ async function computeSegmentDistances(
       entry.lng,
       exit.lat,
       exit.lng,
-      meta?.resolution ?? undefined
+      meta?.resolution ?? undefined,
     );
     let cells: number | null = null;
     if (route.source === "h3") {
@@ -545,7 +623,7 @@ async function computeSegmentDistances(
         entry.lng,
         exit.lat,
         exit.lng,
-        meta?.resolution ?? undefined
+        meta?.resolution ?? undefined,
       );
       cells = d.distance_h3_cells;
     }
@@ -558,10 +636,15 @@ async function computeSegmentDistances(
 
   const bySegment = new Map<
     number,
-    { distance_h3_cells: number | null; distance_km: number | null; duration_hours: number | null }
+    {
+      distance_h3_cells: number | null;
+      distance_km: number | null;
+      duration_hours: number | null;
+    }
   >();
   for (const seg of segments) {
-    const line = seg.transport_method === "air" || seg.transport_method === "sea";
+    const line =
+      seg.transport_method === "air" || seg.transport_method === "sea";
     let cells = 0;
     let km = 0;
     let hours = 0;
@@ -593,9 +676,14 @@ async function computeSegmentDistances(
   return bySegment;
 }
 
-async function loadTransporterNames(ids: number[]): Promise<Map<number, string>> {
+async function loadTransporterNames(
+  ids: number[],
+): Promise<Map<number, string>> {
   if (ids.length === 0) return new Map();
-  const result = await pool.query(`SELECT id, full_name FROM users WHERE id = ANY($1::int[])`, [ids]);
+  const result = await pool.query(
+    `SELECT id, full_name FROM users WHERE id = ANY($1::int[])`,
+    [ids],
+  );
   const map = new Map<number, string>();
   for (const row of result.rows) {
     map.set(Number(row.id), String(row.full_name ?? ""));
@@ -617,7 +705,7 @@ function nodeLabel(nodeId: string, zoneNames: Map<number, string>): string {
 function nodeCoords(
   nodeId: string,
   order: OrderResponse,
-  zoneCoords: Map<number, { lat: number; lng: number }>
+  zoneCoords: Map<number, { lat: number; lng: number }>,
 ): { lat: number | null; lng: number | null } {
   if (nodeId === "sender") {
     return { lat: order.sender_lat, lng: order.sender_lng };
@@ -634,7 +722,7 @@ function nodeCoords(
 }
 
 function summarizeRouteStatus(
-  segments: { cost_status: SegmentCostStatus; final_cost: number | null }[]
+  segments: { cost_status: SegmentCostStatus; final_cost: number | null }[],
 ): {
   status: RouteCostStatus;
   missing_segment_count: number;
@@ -642,12 +730,16 @@ function summarizeRouteStatus(
   total_final_cost: number | null;
 } {
   const missing = segments.filter((s) => s.cost_status === "missing").length;
-  const requested = segments.filter((s) => s.cost_status === "requested").length;
+  const requested = segments.filter(
+    (s) => s.cost_status === "requested",
+  ).length;
   const pending = missing + requested;
   const withFinal = segments.filter((s) => s.final_cost != null);
   const total =
     withFinal.length > 0
-      ? Math.round(withFinal.reduce((sum, s) => sum + (s.final_cost ?? 0), 0) * 100) / 100
+      ? Math.round(
+          withFinal.reduce((sum, s) => sum + (s.final_cost ?? 0), 0) * 100,
+        ) / 100
       : null;
 
   let status: RouteCostStatus = "complete";
@@ -665,11 +757,17 @@ function summarizeRouteStatus(
 /** Drivers may only see costs for legs they operate — not other transporters on the same route. */
 function scopeRouteSummaryForDriver(
   summary: RouteCostSummaryResponse,
-  driverUserId: number
+  driverUserId: number,
 ): RouteCostSummaryResponse {
-  const segments = summary.segments.filter((s) => s.transporter_id === driverUserId);
-  const { status, missing_segment_count, requested_segment_count, total_final_cost } =
-    summarizeRouteStatus(segments);
+  const segments = summary.segments.filter(
+    (s) => s.transporter_id === driverUserId,
+  );
+  const {
+    status,
+    missing_segment_count,
+    requested_segment_count,
+    total_final_cost,
+  } = summarizeRouteStatus(segments);
 
   let totalCalculated = 0;
   let calculatedCount = 0;
@@ -696,7 +794,8 @@ function scopeRouteSummaryForDriver(
     segment_count: segments.length,
     total_calculated_cost:
       calculatedCount > 0 ? Math.round(totalCalculated * 100) / 100 : null,
-    total_manual_cost: manualCount > 0 ? Math.round(totalManual * 100) / 100 : null,
+    total_manual_cost:
+      manualCount > 0 ? Math.round(totalManual * 100) / 100 : null,
     total_final_cost,
     missing_segment_count,
     requested_segment_count,
@@ -710,12 +809,13 @@ function scopeRouteSummaryForDriver(
  */
 export async function syncOrderRoutesFromPreview(
   order: OrderResponse,
-  liveChains?: RouteChain[]
+  liveChains?: RouteChain[],
 ): Promise<number[]> {
   if (await isOrderRouteLocked(order.id)) {
-    const existing = await pool.query(`SELECT id FROM order_routes WHERE order_id = $1 ORDER BY route_index`, [
-      order.id,
-    ]);
+    const existing = await pool.query(
+      `SELECT id FROM order_routes WHERE order_id = $1 ORDER BY route_index`,
+      [order.id],
+    );
     return existing.rows.map((row) => Number(row.id));
   }
 
@@ -725,7 +825,9 @@ export async function syncOrderRoutesFromPreview(
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-    await client.query(`DELETE FROM order_routes WHERE order_id = $1`, [order.id]);
+    await client.query(`DELETE FROM order_routes WHERE order_id = $1`, [
+      order.id,
+    ]);
 
     for (let i = 0; i < chains.length; i++) {
       const chain = chains[i];
@@ -747,7 +849,7 @@ export async function syncOrderRoutesFromPreview(
           JSON.stringify(chain.zone_ids),
           JSON.stringify(chain.connection_ids),
           JSON.stringify(uniqueTransporters),
-        ]
+        ],
       );
       routeIds.push(Number(insert.rows[0].id));
     }
@@ -763,27 +865,33 @@ export async function syncOrderRoutesFromPreview(
   return routeIds;
 }
 
-async function driverHasOrderSegmentAccess(orderId: number, driverUserId: number): Promise<boolean> {
+async function driverHasOrderSegmentAccess(
+  orderId: number,
+  driverUserId: number,
+): Promise<boolean> {
   const result = await pool.query(
     `SELECT 1
      FROM route_segment_costs sc
      JOIN order_routes r ON r.id = sc.route_id
      WHERE r.order_id = $1 AND sc.transporter_id = $2
      LIMIT 1`,
-    [orderId, driverUserId]
+    [orderId, driverUserId],
   );
   return (result.rowCount ?? 0) > 0;
 }
 
 async function getOrderForCostAccess(
   orderId: number,
-  ctx: OrderContext
+  ctx: OrderContext,
 ): Promise<OrderResponse> {
   if (ctx.role === "driver") {
     const assigned = await getOrderById(orderId, ctx);
     if (assigned) return assigned;
     if (await driverHasOrderSegmentAccess(orderId, ctx.userId)) {
-      const order = await getOrderById(orderId, { userId: ctx.userId, role: "admin" });
+      const order = await getOrderById(orderId, {
+        userId: ctx.userId,
+        role: "admin",
+      });
       if (!order) throw new RouteCostError("Order not found", 404);
       return order;
     }
@@ -797,14 +905,14 @@ async function getOrderForCostAccess(
 
 async function assertRouteAccess(
   routeId: number,
-  ctx: OrderContext
+  ctx: OrderContext,
 ): Promise<{ order: OrderResponse; route: Record<string, unknown> }> {
   const result = await pool.query(
     `SELECT r.*, o.sender_user_id, o.receiver_user_id
      FROM order_routes r
      JOIN orders o ON o.id = r.order_id
      WHERE r.id = $1`,
-    [routeId]
+    [routeId],
   );
   if (result.rowCount === 0) throw new RouteCostError("Route not found", 404);
   const row = result.rows[0];
@@ -833,7 +941,7 @@ async function assertRouteAccess(
 export async function calculateRouteCost(
   routeId: number,
   ctx: OrderContext,
-  preservedManualByZoneSig?: Map<string, number>
+  preservedManualByZoneSig?: Map<string, number>,
 ): Promise<RouteCostSummaryResponse> {
   const { order, route } = await assertRouteAccess(routeId, ctx);
   const zoneIds = parseJsonIntArray(route.zone_ids);
@@ -852,23 +960,27 @@ export async function calculateRouteCost(
     zoneCoords,
     zoneLineDistances,
     connectionsById,
-    segments
+    segments,
   );
   const sig = zoneSignature(zoneIds);
 
   // Preserve any manual cost a user already entered so a recalculation does
   // not silently wipe it. Keyed by segment_index, which is stable for a route.
-  const preservedManual = new Map<number, { cost: number; source: "manual" | "external" }>();
+  const preservedManual = new Map<
+    number,
+    { cost: number; source: "manual" | "external" }
+  >();
   const preservedRequested = new Set<number>();
   const existingSegs = await pool.query(
     `SELECT segment_index, manual_cost, cost_source, cost_status FROM route_segment_costs
      WHERE route_id = $1`,
-    [routeId]
+    [routeId],
   );
   for (const row of existingSegs.rows) {
     const idx = Number(row.segment_index);
     if (String(row.cost_status) === "manual" && row.manual_cost != null) {
-      const source = String(row.cost_source) === "external" ? "external" : "manual";
+      const source =
+        String(row.cost_source) === "external" ? "external" : "manual";
       preservedManual.set(idx, {
         cost: Number(row.manual_cost),
         source,
@@ -881,14 +993,21 @@ export async function calculateRouteCost(
   // are keyed by zone signature; merge them in for this route.
   if (preservedManualByZoneSig) {
     for (const seg of segments) {
-      const carried = preservedManualByZoneSig.get(`${sig}::${seg.segment_index}`);
+      const carried = preservedManualByZoneSig.get(
+        `${sig}::${seg.segment_index}`,
+      );
       if (carried != null) {
-        preservedManual.set(seg.segment_index, { cost: carried, source: "manual" });
+        preservedManual.set(seg.segment_index, {
+          cost: carried,
+          source: "manual",
+        });
       }
     }
   }
 
-  await pool.query(`DELETE FROM route_segment_costs WHERE route_id = $1`, [routeId]);
+  await pool.query(`DELETE FROM route_segment_costs WHERE route_id = $1`, [
+    routeId,
+  ]);
 
   const segmentRows: RouteSegmentCostResponse[] = [];
   let totalCalculated = 0;
@@ -902,9 +1021,11 @@ export async function calculateRouteCost(
   for (const seg of segments) {
     const zoneId = seg.from_zone_id;
     const zoneInfo = zoneId != null ? zoneMeta.get(zoneId) : null;
-    const pricingEntry = zoneId != null ? zonePricing.get(zoneId) ?? null : null;
+    const pricingEntry =
+      zoneId != null ? (zonePricing.get(zoneId) ?? null) : null;
     const rate = pricingEntry?.rate ?? null;
-    const lineDistanceKm = zoneId != null ? zoneLineDistances.get(zoneId) ?? null : null;
+    const lineDistanceKm =
+      zoneId != null ? (zoneLineDistances.get(zoneId) ?? null) : null;
     const cost = calculateSegmentCost({
       segment: seg,
       order,
@@ -981,8 +1102,10 @@ export async function calculateRouteCost(
         cost.cost_status,
         cost.cost_source,
         cost.currency,
-        cost.calculation_breakdown ? JSON.stringify(cost.calculation_breakdown) : null,
-      ]
+        cost.calculation_breakdown
+          ? JSON.stringify(cost.calculation_breakdown)
+          : null,
+      ],
     );
 
     segmentRows.push(
@@ -990,8 +1113,8 @@ export async function calculateRouteCost(
         insert.rows[0],
         zoneMeta,
         await loadTransporterNames([seg.transporter_id]),
-        zonePricing
-      )
+        zonePricing,
+      ),
     );
   }
 
@@ -999,10 +1122,16 @@ export async function calculateRouteCost(
     cost_status: s.cost_status,
     final_cost: s.final_cost,
   }));
-  const { status, missing_segment_count, requested_segment_count, total_final_cost } =
-    summarizeRouteStatus(summaryInput);
+  const {
+    status,
+    missing_segment_count,
+    requested_segment_count,
+    total_final_cost,
+  } = summarizeRouteStatus(summaryInput);
 
-  await pool.query(`DELETE FROM route_cost_summaries WHERE route_id = $1`, [routeId]);
+  await pool.query(`DELETE FROM route_cost_summaries WHERE route_id = $1`, [
+    routeId,
+  ]);
   await pool.query(
     `INSERT INTO route_cost_summaries
        (route_id, order_id, total_calculated_cost, total_manual_cost, total_final_cost,
@@ -1018,7 +1147,7 @@ export async function calculateRouteCost(
       requested_segment_count,
       segmentRows[0]?.currency ?? "CAD",
       status,
-    ]
+    ],
   );
 
   return buildRouteSummaryResponse(route, order, segmentRows);
@@ -1028,7 +1157,7 @@ async function buildSegmentResponse(
   row: Record<string, unknown>,
   zoneMeta: Map<number, { zone_name: string }>,
   transporterNames: Map<number, string>,
-  zonePricing?: Map<number, ZonePricingEntry>
+  zonePricing?: Map<number, ZonePricingEntry>,
 ): Promise<RouteSegmentCostResponse> {
   const zoneNames = new Map<number, string>();
   zoneMeta.forEach((v, k) => zoneNames.set(k, v.zone_name));
@@ -1043,7 +1172,7 @@ async function buildSegmentResponse(
 
   const tid = Number(row.transporter_id);
   const zoneId = nodeIdToZoneId(String(row.from_node_id));
-  const pricing = zoneId != null ? zonePricing?.get(zoneId) ?? null : null;
+  const pricing = zoneId != null ? (zonePricing?.get(zoneId) ?? null) : null;
   return {
     segment_id: Number(row.id),
     segment_index: Number(row.segment_index),
@@ -1060,10 +1189,12 @@ async function buildSegmentResponse(
     effective_base_fee: pricing?.effective_base_fee ?? null,
     effective_cost_per_km: pricing?.effective_cost_per_km ?? null,
     effective_cost_per_hour: pricing?.effective_cost_per_hour ?? null,
-    distance_h3_cells: row.distance_h3_cells != null ? Number(row.distance_h3_cells) : null,
+    distance_h3_cells:
+      row.distance_h3_cells != null ? Number(row.distance_h3_cells) : null,
     distance_km: row.distance_km != null ? Number(row.distance_km) : null,
     time_hours: row.time_hours != null ? Number(row.time_hours) : null,
-    package_factor: row.package_factor != null ? Number(row.package_factor) : null,
+    package_factor:
+      row.package_factor != null ? Number(row.package_factor) : null,
     base_fee: row.base_fee != null ? Number(row.base_fee) : null,
     distance_cost: row.distance_cost != null ? Number(row.distance_cost) : null,
     waiting_cost: row.waiting_cost != null ? Number(row.waiting_cost) : null,
@@ -1071,12 +1202,15 @@ async function buildSegmentResponse(
     weight_cost: null,
     volume_cost: null,
     time_factor_amount: null,
-    calculated_cost: row.calculated_cost != null ? Number(row.calculated_cost) : null,
+    calculated_cost:
+      row.calculated_cost != null ? Number(row.calculated_cost) : null,
     manual_cost: row.manual_cost != null ? Number(row.manual_cost) : null,
     final_cost: row.final_cost != null ? Number(row.final_cost) : null,
     cost_status: String(row.cost_status) as SegmentCostStatus,
     cost_source:
-      row.cost_source == null ? null : (String(row.cost_source) as SegmentCostSource),
+      row.cost_source == null
+        ? null
+        : (String(row.cost_source) as SegmentCostSource),
     currency: String(row.currency ?? "CAD"),
     breakdown,
   };
@@ -1085,17 +1219,23 @@ async function buildSegmentResponse(
 async function buildRouteSummaryResponse(
   route: Record<string, unknown>,
   order: OrderResponse,
-  segments: RouteSegmentCostResponse[]
+  segments: RouteSegmentCostResponse[],
 ): Promise<RouteCostSummaryResponse> {
   const transporterIds = parseJsonIntArray(route.transporter_ids);
   const names = await loadTransporterNames(transporterIds);
-  const transporters = transporterIds.map((id) => names.get(id) ?? `Transporter #${id}`);
-  const { status, missing_segment_count, requested_segment_count, total_final_cost } =
-    summarizeRouteStatus(segments);
+  const transporters = transporterIds.map(
+    (id) => names.get(id) ?? `Transporter #${id}`,
+  );
+  const {
+    status,
+    missing_segment_count,
+    requested_segment_count,
+    total_final_cost,
+  } = summarizeRouteStatus(segments);
 
   const summaryResult = await pool.query(
     `SELECT * FROM route_cost_summaries WHERE route_id = $1`,
-    [Number(route.id)]
+    [Number(route.id)],
   );
   const summary = summaryResult.rows[0];
 
@@ -1105,8 +1245,14 @@ async function buildRouteSummaryResponse(
     route_label: String(route.route_label ?? ""),
     transporters,
     segment_count: segments.length,
-    total_calculated_cost: summary?.total_calculated_cost != null ? Number(summary.total_calculated_cost) : null,
-    total_manual_cost: summary?.total_manual_cost != null ? Number(summary.total_manual_cost) : null,
+    total_calculated_cost:
+      summary?.total_calculated_cost != null
+        ? Number(summary.total_calculated_cost)
+        : null,
+    total_manual_cost:
+      summary?.total_manual_cost != null
+        ? Number(summary.total_manual_cost)
+        : null,
     total_final_cost,
     missing_segment_count,
     requested_segment_count,
@@ -1118,13 +1264,13 @@ async function buildRouteSummaryResponse(
 
 export async function getRouteCostSummary(
   routeId: number,
-  ctx: OrderContext
+  ctx: OrderContext,
 ): Promise<RouteCostSummaryResponse> {
   const { order, route } = await assertRouteAccess(routeId, ctx);
 
   const segResult = await pool.query(
     `SELECT * FROM route_segment_costs WHERE route_id = $1 ORDER BY segment_index`,
-    [routeId]
+    [routeId],
   );
 
   const zoneIds = parseJsonIntArray(route.zone_ids);
@@ -1136,9 +1282,12 @@ export async function getRouteCostSummary(
   // newly configured), or when segmentation is stale. `requested` (e.g. air
   // awaiting quote) is stable and must NOT trigger recalc on every read.
   const needsRecalc = segResult.rows.some((r) =>
-    segmentNeedsRecalculation(String(r.cost_status) as SegmentCostStatus)
+    segmentNeedsRecalculation(String(r.cost_status) as SegmentCostStatus),
   );
-  const expectedSegmentCount = deriveSegmentsFromRoute(zoneIds, zoneMeta).length;
+  const expectedSegmentCount = deriveSegmentsFromRoute(
+    zoneIds,
+    zoneMeta,
+  ).length;
   const segmentationStale = segResult.rowCount !== expectedSegmentCount;
   if (segResult.rowCount === 0 || needsRecalc || segmentationStale) {
     const summary = await calculateRouteCost(routeId, ctx);
@@ -1152,7 +1301,9 @@ export async function getRouteCostSummary(
 
   const segments: RouteSegmentCostResponse[] = [];
   for (const row of segResult.rows) {
-    segments.push(await buildSegmentResponse(row, zoneMeta, names, zonePricing));
+    segments.push(
+      await buildSegmentResponse(row, zoneMeta, names, zonePricing),
+    );
   }
 
   const summary = await buildRouteSummaryResponse(route, order, segments);
@@ -1163,7 +1314,7 @@ export async function getRouteCostSummary(
 
 export async function getRouteSegmentCosts(
   routeId: number,
-  ctx: OrderContext
+  ctx: OrderContext,
 ): Promise<RouteSegmentCostResponse[]> {
   const summary = await getRouteCostSummary(routeId, ctx);
   return summary.segments;
@@ -1172,7 +1323,7 @@ export async function getRouteSegmentCosts(
 export async function applyManualSegmentCost(
   segmentCostId: number,
   manualCost: number,
-  ctx: OrderContext
+  ctx: OrderContext,
 ): Promise<RouteSegmentCostResponse> {
   return applyQuotedSegmentCost(segmentCostId, manualCost, "manual", ctx);
 }
@@ -1180,7 +1331,7 @@ export async function applyManualSegmentCost(
 export async function applyExternalSegmentCost(
   segmentCostId: number,
   quotedCost: number,
-  ctx: OrderContext
+  ctx: OrderContext,
 ): Promise<RouteSegmentCostResponse> {
   return applyQuotedSegmentCost(segmentCostId, quotedCost, "external", ctx);
 }
@@ -1189,12 +1340,12 @@ export { isExternalQuoteConfigured };
 
 export async function fetchExternalSegmentQuote(
   segmentCostId: number,
-  ctx: OrderContext
+  ctx: OrderContext,
 ): Promise<RouteSegmentCostResponse> {
   if (!isExternalQuoteConfigured()) {
     throw new RouteCostError(
       "External quote webhook is not configured (EXTERNAL_QUOTE_WEBHOOK_URL)",
-      503
+      503,
     );
   }
 
@@ -1204,9 +1355,10 @@ export async function fetchExternalSegmentQuote(
      JOIN order_routes r ON r.id = sc.route_id
      JOIN orders o ON o.id = r.order_id
      WHERE sc.id = $1`,
-    [segmentCostId]
+    [segmentCostId],
   );
-  if (segResult.rowCount === 0) throw new RouteCostError("Segment cost not found", 404);
+  if (segResult.rowCount === 0)
+    throw new RouteCostError("Segment cost not found", 404);
   const seg = segResult.rows[0];
   const senderId = Number(seg.sender_user_id);
   const receiverId = Number(seg.receiver_user_id);
@@ -1216,19 +1368,31 @@ export async function fetchExternalSegmentQuote(
     (ctx.role === "sender" && ctx.userId === senderId) ||
     (ctx.role === "receiver" && ctx.userId === receiverId);
   if (!isParty) {
-    throw new RouteCostError("Only the order sender, receiver, or an admin can fetch external quotes", 403);
+    throw new RouteCostError(
+      "Only the order sender, receiver, or an admin can fetch external quotes",
+      403,
+    );
   }
 
   const status = String(seg.cost_status);
   const method = String(seg.transport_method);
   if (status === "manual") {
-    throw new RouteCostError("Segment already has a manual or external cost", 400);
+    throw new RouteCostError(
+      "Segment already has a manual or external cost",
+      400,
+    );
   }
   if (status === "calculated" && method !== "air") {
-    throw new RouteCostError("External quotes apply to requested air/sea segments or missing costs", 400);
+    throw new RouteCostError(
+      "External quotes apply to requested air/sea segments or missing costs",
+      400,
+    );
   }
   if (status !== "requested" && status !== "missing" && method !== "air") {
-    throw new RouteCostError("This segment does not need an external quote", 400);
+    throw new RouteCostError(
+      "This segment does not need an external quote",
+      400,
+    );
   }
 
   const order = await getOrderById(Number(seg.order_id), ctx);
@@ -1273,7 +1437,12 @@ export async function fetchExternalSegmentQuote(
 
   try {
     const quote = await fetchExternalQuote(payload);
-    return applyQuotedSegmentCost(segmentCostId, quote.quoted_cost, "external", ctx);
+    return applyQuotedSegmentCost(
+      segmentCostId,
+      quote.quoted_cost,
+      "external",
+      ctx,
+    );
   } catch (err) {
     if (err instanceof ExternalQuoteError) {
       throw new RouteCostError(err.message, err.status);
@@ -1284,7 +1453,7 @@ export async function fetchExternalSegmentQuote(
 
 export async function requestSegmentQuote(
   segmentCostId: number,
-  ctx: OrderContext
+  ctx: OrderContext,
 ): Promise<RouteSegmentCostResponse> {
   const segResult = await pool.query(
     `SELECT sc.*, r.order_id, r.id AS route_id, r.transporter_ids, r.zone_ids, o.sender_user_id, o.receiver_user_id
@@ -1292,9 +1461,10 @@ export async function requestSegmentQuote(
      JOIN order_routes r ON r.id = sc.route_id
      JOIN orders o ON o.id = r.order_id
      WHERE sc.id = $1`,
-    [segmentCostId]
+    [segmentCostId],
   );
-  if (segResult.rowCount === 0) throw new RouteCostError("Segment cost not found", 404);
+  if (segResult.rowCount === 0)
+    throw new RouteCostError("Segment cost not found", 404);
   const seg = segResult.rows[0];
   const orderId = Number(seg.order_id);
   const senderId = Number(seg.sender_user_id);
@@ -1305,34 +1475,51 @@ export async function requestSegmentQuote(
     (ctx.role === "sender" && ctx.userId === senderId) ||
     (ctx.role === "receiver" && ctx.userId === receiverId);
   if (!isParty) {
-    throw new RouteCostError("Only the order sender, receiver, or an admin can request a quote", 403);
+    throw new RouteCostError(
+      "Only the order sender, receiver, or an admin can request a quote",
+      403,
+    );
   }
 
   const status = String(seg.cost_status);
   if (status === "manual") {
-    throw new RouteCostError("Manual costs cannot be reverted to a quote request", 400);
+    throw new RouteCostError(
+      "Manual costs cannot be reverted to a quote request",
+      400,
+    );
   }
 
   const pricedZoneId = pricedZoneIdForSegment(seg);
   if (pricedZoneId == null) {
-    throw new RouteCostError("Cannot resolve priced zone for this segment", 400);
+    throw new RouteCostError(
+      "Cannot resolve priced zone for this segment",
+      400,
+    );
   }
 
   const transporterId = Number(seg.transporter_id);
-  const siblings = await findSiblingSegmentRows(orderId, transporterId, pricedZoneId, [
-    "requested",
-    "missing",
-    "calculated",
-    "manual",
-  ]);
+  const siblings = await findSiblingSegmentRows(
+    orderId,
+    transporterId,
+    pricedZoneId,
+    ["requested", "missing", "calculated", "manual"],
+  );
   if (siblings.some((s) => String(s.cost_status) === "manual")) {
-    throw new RouteCostError("Manual costs cannot be reverted to a quote request", 400);
+    throw new RouteCostError(
+      "Manual costs cannot be reverted to a quote request",
+      400,
+    );
   }
   const pending = siblings.filter(
-    (s) => String(s.cost_status) === "missing" || String(s.cost_status) === "calculated"
+    (s) =>
+      String(s.cost_status) === "missing" ||
+      String(s.cost_status) === "calculated",
   );
   if (pending.length === 0) {
-    throw new RouteCostError("A quote has already been requested for this segment", 400);
+    throw new RouteCostError(
+      "A quote has already been requested for this segment",
+      400,
+    );
   }
 
   const pendingIds = pending.map((s) => Number(s.id));
@@ -1343,7 +1530,7 @@ export async function requestSegmentQuote(
          cost_status = 'requested', cost_source = NULL, calculation_breakdown = NULL,
          updated_at = NOW()
      WHERE id = ANY($1::int[])`,
-    [pendingIds]
+    [pendingIds],
   );
 
   const routeIds = siblings.map((s) => Number(s.route_id));
@@ -1353,7 +1540,10 @@ export async function requestSegmentQuote(
   const zoneMeta = await loadZoneMetaForIds(zoneIds);
   const zonePricing = await loadZonePricing(zoneIds);
   const names = await loadTransporterNames([transporterId]);
-  const updated = await pool.query(`SELECT * FROM route_segment_costs WHERE id = $1`, [segmentCostId]);
+  const updated = await pool.query(
+    `SELECT * FROM route_segment_costs WHERE id = $1`,
+    [segmentCostId],
+  );
 
   void createUserNotification({
     user_id: transporterId,
@@ -1361,7 +1551,9 @@ export async function requestSegmentQuote(
     type: "quote_request",
     title: "Quote requested",
     body: `A quote was requested for your segment on shipment #${orderId}. Open Quote Requests to respond.`,
-  }).catch((err) => console.error("[notifications] quote_request failed:", err));
+  }).catch((err) =>
+    console.error("[notifications] quote_request failed:", err),
+  );
 
   return buildSegmentResponse(updated.rows[0], zoneMeta, names, zonePricing);
 }
@@ -1370,33 +1562,47 @@ async function applyQuotedSegmentCost(
   segmentCostId: number,
   quotedCost: number,
   source: "manual" | "external",
-  ctx: OrderContext
+  ctx: OrderContext,
 ): Promise<RouteSegmentCostResponse> {
   const segResult = await pool.query(
     `SELECT sc.*, r.order_id, r.id AS route_id, r.transporter_ids, r.zone_ids
      FROM route_segment_costs sc
      JOIN order_routes r ON r.id = sc.route_id
      WHERE sc.id = $1`,
-    [segmentCostId]
+    [segmentCostId],
   );
-  if (segResult.rowCount === 0) throw new RouteCostError("Segment cost not found", 404);
+  if (segResult.rowCount === 0)
+    throw new RouteCostError("Segment cost not found", 404);
   const seg = segResult.rows[0];
 
   if (ctx.role === "driver" && Number(seg.transporter_id) !== ctx.userId) {
-    throw new RouteCostError("You can only enter manual cost for your own segments", 403);
+    throw new RouteCostError(
+      "You can only enter manual cost for your own segments",
+      403,
+    );
   }
   if (ctx.role !== "admin" && ctx.role !== "driver") {
-    throw new RouteCostError("Only admins and transporters can enter manual segment costs", 403);
+    throw new RouteCostError(
+      "Only admins and transporters can enter manual segment costs",
+      403,
+    );
   }
 
   const orderId = Number(seg.order_id);
   const transporterId = Number(seg.transporter_id);
   const pricedZoneId = pricedZoneIdForSegment(seg);
   if (pricedZoneId == null) {
-    throw new RouteCostError("Cannot resolve priced zone for this segment", 400);
+    throw new RouteCostError(
+      "Cannot resolve priced zone for this segment",
+      400,
+    );
   }
 
-  const siblings = await findSiblingSegmentRows(orderId, transporterId, pricedZoneId);
+  const siblings = await findSiblingSegmentRows(
+    orderId,
+    transporterId,
+    pricedZoneId,
+  );
   const siblingIds = siblings.map((s) => Number(s.id));
   if (siblingIds.length === 0) {
     throw new RouteCostError("Segment cost not found", 404);
@@ -1406,7 +1612,7 @@ async function applyQuotedSegmentCost(
     `UPDATE route_segment_costs
      SET manual_cost = $2, final_cost = $2, cost_status = 'manual', cost_source = $3, updated_at = NOW()
      WHERE id = ANY($1::int[])`,
-    [siblingIds, quotedCost, source]
+    [siblingIds, quotedCost, source],
   );
 
   await recalculateRouteSummaries(siblings.map((s) => Number(s.route_id)));
@@ -1415,7 +1621,10 @@ async function applyQuotedSegmentCost(
   const zoneMeta = await loadZoneMetaForIds(zoneIdsQuoted);
   const zonePricing = await loadZonePricing(zoneIdsQuoted);
   const names = await loadTransporterNames([transporterId]);
-  const updated = await pool.query(`SELECT * FROM route_segment_costs WHERE id = $1`, [segmentCostId]);
+  const updated = await pool.query(
+    `SELECT * FROM route_segment_costs WHERE id = $1`,
+    [segmentCostId],
+  );
   return buildSegmentResponse(updated.rows[0], zoneMeta, names, zonePricing);
 }
 
@@ -1423,7 +1632,7 @@ async function recalculateRouteSummary(routeId: number): Promise<void> {
   const segResult = await pool.query(
     `SELECT cost_status, final_cost, calculated_cost, manual_cost, currency
      FROM route_segment_costs WHERE route_id = $1`,
-    [routeId]
+    [routeId],
   );
   const segments = segResult.rows.map((r) => ({
     cost_status: String(r.cost_status) as SegmentCostStatus,
@@ -1445,9 +1654,16 @@ async function recalculateRouteSummary(routeId: number): Promise<void> {
     }
   }
 
-  const { status, missing_segment_count, requested_segment_count, total_final_cost } =
-    summarizeRouteStatus(segments);
-  const routeResult = await pool.query(`SELECT order_id FROM order_routes WHERE id = $1`, [routeId]);
+  const {
+    status,
+    missing_segment_count,
+    requested_segment_count,
+    total_final_cost,
+  } = summarizeRouteStatus(segments);
+  const routeResult = await pool.query(
+    `SELECT order_id FROM order_routes WHERE id = $1`,
+    [routeId],
+  );
   const orderId = Number(routeResult.rows[0]?.order_id);
 
   await pool.query(
@@ -1473,14 +1689,14 @@ async function recalculateRouteSummary(routeId: number): Promise<void> {
       requested_segment_count,
       String(segResult.rows[0]?.currency ?? "CAD"),
       status,
-    ]
+    ],
   );
 }
 
 async function resyncAndCostOrder(
   order: OrderResponse,
   ctx: OrderContext,
-  liveChains?: RouteChain[]
+  liveChains?: RouteChain[],
 ): Promise<void> {
   const preservedManual = await snapshotManualCosts(order.id);
   const routeIds = await syncOrderRoutesFromPreview(order, liveChains);
@@ -1493,19 +1709,21 @@ async function buildOrderRouteComparison(
   orderId: number,
   ctx: OrderContext,
   liveChains?: RouteChain[],
-  order?: OrderResponse
+  order?: OrderResponse,
 ): Promise<OrderRouteCostComparisonResponse> {
   const orderRow = order ?? (await getOrderForCostAccess(orderId, ctx));
   const lockInfo = await getOrderRouteLockInfo(orderId);
   const routesResult = await pool.query(
     `SELECT * FROM order_routes WHERE order_id = $1 ORDER BY route_index`,
-    [orderId]
+    [orderId],
   );
 
   // For confirmed / in-progress deliveries, keep the persisted route snapshot
   // even when it no longer appears in the live zone graph.
   const liveSigs =
-    !lockInfo.locked && liveChains ? new Set(liveChains.map(chainSignature)) : null;
+    !lockInfo.locked && liveChains
+      ? new Set(liveChains.map(chainSignature))
+      : null;
   const storedRows = liveSigs
     ? routesResult.rows.filter((r) => liveSigs.has(storedRouteSignature(r)))
     : routesResult.rows;
@@ -1532,7 +1750,8 @@ async function buildOrderRouteComparison(
     orderRow.package_height != null
       ? `${orderRow.package_length} × ${orderRow.package_width} × ${orderRow.package_height} in`
       : orderRow.dimensions || null;
-  const weightLbs = orderRow.weight_lbs != null ? Number(orderRow.weight_lbs) : null;
+  const weightLbs =
+    orderRow.weight_lbs != null ? Number(orderRow.weight_lbs) : null;
 
   return {
     order_id: orderId,
@@ -1551,13 +1770,13 @@ async function buildOrderRouteComparison(
 
 export async function recalculateRouteCostsForOrder(
   orderId: number,
-  ctx: OrderContext
+  ctx: OrderContext,
 ): Promise<OrderRouteCostComparisonResponse> {
   const order = await getOrderForCostAccess(orderId, ctx);
   if (order.tracking_status === "AWAITING_CONNECT") {
     throw new RouteCostError(
       "Sender must connect this shipment request before routes can be calculated",
-      400
+      400,
     );
   }
   const lockInfo = await getOrderRouteLockInfo(order.id);
@@ -1576,13 +1795,13 @@ export async function recalculateRouteCostsForOrder(
 
 export async function compareOrderRoutes(
   orderId: number,
-  ctx: OrderContext
+  ctx: OrderContext,
 ): Promise<OrderRouteCostComparisonResponse> {
   const order = await getOrderForCostAccess(orderId, ctx);
   if (order.tracking_status === "AWAITING_CONNECT") {
     throw new RouteCostError(
       "Sender must connect this shipment request before routes can be calculated",
-      400
+      400,
     );
   }
   const lockInfo = await getOrderRouteLockInfo(order.id);
@@ -1608,12 +1827,15 @@ export async function compareOrderRoutes(
   return buildOrderRouteComparison(orderId, ctx, liveChains, order);
 }
 
-export async function markMissingCostSegments(routeId: number, ctx: OrderContext): Promise<void> {
+export async function markMissingCostSegments(
+  routeId: number,
+  ctx: OrderContext,
+): Promise<void> {
   await getRouteCostSummary(routeId, ctx);
 }
 
 export async function listTransporterQuoteRequests(
-  ctx: OrderContext
+  ctx: OrderContext,
 ): Promise<TransporterQuoteRequestItem[]> {
   if (ctx.role !== "driver" && ctx.role !== "admin") {
     throw new RouteCostError("Forbidden", 403);
@@ -1640,12 +1862,14 @@ export async function listTransporterQuoteRequests(
      ORDER BY
        CASE WHEN sc.cost_status = 'requested' THEN 0 ELSE 1 END,
        sc.updated_at DESC`,
-    params
+    params,
   );
 
   const items: TransporterQuoteRequestItem[] = [];
   type RowGroup = {
-    rows: Array<Record<string, unknown> & { route_id: number; route_label: string }>;
+    rows: Array<
+      Record<string, unknown> & { route_id: number; route_label: string }
+    >;
     pricedZoneId: number;
   };
   const groups = new Map<string, RowGroup>();
@@ -1656,7 +1880,7 @@ export async function listTransporterQuoteRequests(
     const key = quoteDedupKey(
       Number(row.order_id),
       Number(row.transporter_id),
-      pricedZoneId
+      pricedZoneId,
     );
     const existing = groups.get(key);
     if (existing) {
@@ -1671,14 +1895,22 @@ export async function listTransporterQuoteRequests(
       const statusRank = (s: unknown) => (String(s) === "requested" ? 0 : 1);
       const rankDiff = statusRank(a.cost_status) - statusRank(b.cost_status);
       if (rankDiff !== 0) return rankDiff;
-      return new Date(String(b.updated_at)).getTime() - new Date(String(a.updated_at)).getTime();
+      return (
+        new Date(String(b.updated_at)).getTime() -
+        new Date(String(a.updated_at)).getTime()
+      );
     });
     const primary = rows[0];
     const zoneIds = parseJsonIntArray(primary.zone_ids);
     const zoneMeta = await loadZoneMetaForIds(zoneIds);
     const zonePricing = await loadZonePricing(zoneIds);
     const names = await loadTransporterNames([Number(primary.transporter_id)]);
-    const segment = await buildSegmentResponse(primary, zoneMeta, names, zonePricing);
+    const segment = await buildSegmentResponse(
+      primary,
+      zoneMeta,
+      names,
+      zonePricing,
+    );
 
     const affectedRoutes: AffectedRouteRef[] = [];
     const routeSeen = new Set<number>();
@@ -1706,13 +1938,23 @@ export async function listTransporterQuoteRequests(
       order_id: Number(primary.order_id),
       order_status: String(primary.order_status),
       sender_address: String(primary.sender_address ?? ""),
-      sender_lat: primary.sender_lat != null ? Number(primary.sender_lat) : null,
-      sender_lng: primary.sender_lng != null ? Number(primary.sender_lng) : null,
+      sender_lat:
+        primary.sender_lat != null ? Number(primary.sender_lat) : null,
+      sender_lng:
+        primary.sender_lng != null ? Number(primary.sender_lng) : null,
       destination_address: String(primary.destination_address ?? ""),
-      destination_lat: primary.destination_lat != null ? Number(primary.destination_lat) : null,
-      destination_lng: primary.destination_lng != null ? Number(primary.destination_lng) : null,
-      package_type: primary.package_type != null ? String(primary.package_type) : null,
-      package_weight_lbs: primary.weight_lbs != null ? Number(primary.weight_lbs) : null,
+      destination_lat:
+        primary.destination_lat != null
+          ? Number(primary.destination_lat)
+          : null,
+      destination_lng:
+        primary.destination_lng != null
+          ? Number(primary.destination_lng)
+          : null,
+      package_type:
+        primary.package_type != null ? String(primary.package_type) : null,
+      package_weight_lbs:
+        primary.weight_lbs != null ? Number(primary.weight_lbs) : null,
       package_dimensions_in: dims,
       priced_zone_id: group.pricedZoneId,
       route_id: Number(primary.route_id),
@@ -1728,7 +1970,8 @@ export async function listTransporterQuoteRequests(
 
   items.sort((a, b) => {
     const statusRank = (s: SegmentCostStatus) => (s === "requested" ? 0 : 1);
-    const rankDiff = statusRank(a.segment.cost_status) - statusRank(b.segment.cost_status);
+    const rankDiff =
+      statusRank(a.segment.cost_status) - statusRank(b.segment.cost_status);
     if (rankDiff !== 0) return rankDiff;
     return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
   });
