@@ -591,6 +591,11 @@ export async function ensureSchema(): Promise<void> {
        VALUES ('land_speed_kmh', '50')
        ON CONFLICT (key) DO NOTHING;`
     );
+    await client.query(
+      `INSERT INTO system_settings (key, value)
+       VALUES ('pff_factor', '0')
+       ON CONFLICT (key) DO NOTHING;`
+    );
 
     await client.query(`ALTER TABLE route_segment_costs ADD COLUMN IF NOT EXISTS cost_source TEXT;`);
     await client.query(`ALTER TABLE route_cost_summaries ADD COLUMN IF NOT EXISTS requested_segment_count INTEGER NOT NULL DEFAULT 0;`);
@@ -715,7 +720,10 @@ export async function ensureSchema(): Promise<void> {
     await client.query(`ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_tracking_status_check;`);
     await client.query(
       `ALTER TABLE orders ADD CONSTRAINT orders_tracking_status_check
-         CHECK (tracking_status IN ('AWAITING_CONNECT', 'CONFIRMED', 'PICKUP_AVAILABLE', 'PICKED_UP', 'IN_TRANSIT', 'DELIVERED'));`
+         CHECK (tracking_status IN ('AWAITING_CONNECT', 'REJECTED', 'CONFIRMED', 'PICKUP_AVAILABLE', 'PICKED_UP', 'IN_TRANSIT', 'DELIVERED'));`
+    );
+    await client.query(
+      `ALTER TABLE orders ADD COLUMN IF NOT EXISTS route_schedule_at TIMESTAMPTZ;`
     );
     // Reset rows that inherited the old PICKUP_AVAILABLE default before pick ready / delivery.
     await client.query(

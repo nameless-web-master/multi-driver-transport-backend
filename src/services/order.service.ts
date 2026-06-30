@@ -180,6 +180,7 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
       ? row.tracking_status
       : "CONFIRMED") as TrackingStatus,
     pickup_ready_at: row.pickup_ready_at ? new Date(String(row.pickup_ready_at)) : null,
+    route_schedule_at: row.route_schedule_at ? new Date(String(row.route_schedule_at)) : null,
     submitted_at: new Date(String(row.submitted_at)),
     delivering_at: row.delivering_at ? new Date(String(row.delivering_at)) : null,
     received_at: row.received_at ? new Date(String(row.received_at)) : null,
@@ -226,6 +227,7 @@ function rowToOrder(row: Record<string, unknown>): OrderResponse {
     status: order.status,
     tracking_status: order.tracking_status,
     pickup_ready_at: order.pickup_ready_at?.toISOString() ?? null,
+    route_schedule_at: order.route_schedule_at?.toISOString() ?? null,
     route_selection_status: isRouteSelectionStatus(row.route_selection_status)
       ? row.route_selection_status
       : null,
@@ -548,6 +550,94 @@ export async function connectOrderAsSender(
     exclude_user_id: ctx.userId,
   }).catch((err) => console.error("[notifications] order_connected failed:", err));
 
+  return refreshed;
+}
+
+export async function rejectOrderAsSender(
+  orderId: number,
+  ctx: OrderContext,
+  reason?: string
+): Promise<OrderResponse> {
+  if (ctx.role !== "sender" && ctx.role !== "admin") {
+    throw new OrderError("Only senders can reject shipment requests", 403);
+  }
+
+  const existing = await getOrderById(orderId, ctx);
+  if (!existing) throw new OrderError("Order not found", 404);
+  if (ctx.role === "sender" && existing.sender_user_id !== ctx.userId) {
+    throw new OrderError("Forbidden", 403);
+  }
+  if (existing.tracking_status !== "AWAITING_CONNECT") {
+    throw new OrderError("Only pending shipment requests can be rejected", 400);
+  }
+
+  const noteSuffix = reason?.trim()
+    ? `\n[Rejected by sender: ${reason.trim()}]`
+    : "\n[Rejected by sender]";
+
+  await pool.query(
+    `UPDATE orders
+     SET tracking_status = 'REJECTED',
+         notes = CASE WHEN $2 = '' THEN notes ELSE TRIM(COALESCE(notes, '') || $2) END,
+         updated_at = NOW()
+     WHERE id = $1`,
+    [orderId, noteSuffix]
+  );
+  await pool.query(
+    `INSERT INTO order_status_history (order_id, status, updated_by) VALUES ($1, $2, $3)`,
+    [orderId, "REJECTED", ctx.userId]
+  );
+
+  const refreshed = await getOrderById(orderId, ctx);
+  if (!refreshed) throw new OrderError("Failed to load order", 500);
+
+  void notifyUsers({
+    user_ids: [existing.receiver_user_id],
+    order_id: orderId,
+    type: "order_request",
+    title: "Shipment request rejected",
+    body: `${String(existing.sender_name)} rejected shipment request #${orderId}.${reason?.trim() ? ` Reason: ${reason.trim()}` : ""}`,
+    exclude_user_id: ctx.userId,
+  }).catch((err) => console.error("[notifications] order_rejected failed:", err));
+
+  return refreshed;
+}
+
+export async function updateOrderRouteSchedule(
+  orderId: number,
+  scheduleAt: string | null,
+  ctx: OrderContext
+): Promise<OrderResponse> {
+  const existing = await getOrderById(orderId, ctx);
+  if (!existing) throw new OrderError("Order not found", 404);
+  if (ctx.role === "sender" && existing.sender_user_id !== ctx.userId) {
+    throw new OrderError("Forbidden", 403);
+  }
+  if (ctx.role === "receiver" && existing.receiver_user_id !== ctx.userId) {
+    throw new OrderError("Forbidden", 403);
+  }
+  if (ctx.role !== "sender" && ctx.role !== "receiver" && ctx.role !== "admin") {
+    throw new OrderError("Forbidden", 403);
+  }
+  if (existing.tracking_status === "REJECTED") {
+    throw new OrderError("Cannot schedule routes for a rejected order", 400);
+  }
+
+  let parsed: Date | null = null;
+  if (scheduleAt != null && scheduleAt.trim() !== "") {
+    parsed = new Date(scheduleAt);
+    if (Number.isNaN(parsed.getTime())) {
+      throw new OrderError("Invalid route_schedule_at datetime", 400);
+    }
+  }
+
+  await pool.query(
+    `UPDATE orders SET route_schedule_at = $2, updated_at = NOW() WHERE id = $1`,
+    [orderId, parsed]
+  );
+
+  const refreshed = await getOrderById(orderId, ctx);
+  if (!refreshed) throw new OrderError("Failed to load order", 500);
   return refreshed;
 }
 

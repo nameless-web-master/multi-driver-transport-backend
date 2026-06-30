@@ -15,14 +15,15 @@ import {
   segmentNeedsCostEntry,
   segmentNeedsRecalculation,
 } from "../models/routeCost.model";
-import { getBookingFeeRate, getLandSpeedKmh } from "./pricingConfig.service";
+import { getBookingFeeRate, getLandSpeedKmh, getPffFactor } from "./pricingConfig.service";
 import {
   loadRegionsByIds,
   mergeZoneRateWithRegion,
   rateDefaultsConfigured,
 } from "./pricingRegion.service";
 import type { ZonePricingMode } from "../models/pricingRegion.model";
-import { getOrderById, type OrderContext } from "./order.service";
+import { getOrderById, updateOrderRouteSchedule, type OrderContext } from "./order.service";
+import { isPffPaymentMethod } from "../utils/paymentFlow";
 import { createUserNotification } from "./notification.service";
 import {
   DEFAULT_PREVIEW_MAX_DEPTH,
@@ -145,6 +146,7 @@ async function fetchLiveRouteChains(
     destination_name: order.receiver_name,
     destination_address: order.destination_address,
     max_depth: DEFAULT_PREVIEW_MAX_DEPTH,
+    schedule_at: order.route_schedule_at ?? undefined,
   });
 
   return preview.possible_connection_chains;
@@ -1744,6 +1746,51 @@ async function buildOrderRouteComparison(
 
   const currency = routes[0]?.currency ?? "CAD";
   const bookingFeeRate = await getBookingFeeRate();
+  const pffFactor = await getPffFactor();
+  const isPff = isPffPaymentMethod(orderRow.payment_method);
+
+  if (isPff) {
+    for (const route of routes) {
+      if (route.total_final_cost != null) {
+        route.total_final_cost =
+          Math.round(route.total_final_cost * (1 + pffFactor) * 100) / 100;
+      }
+    }
+    routes.sort((a, b) => {
+      if (a.total_final_cost == null && b.total_final_cost == null) return 0;
+      if (a.total_final_cost == null) return 1;
+      if (b.total_final_cost == null) return -1;
+      return a.total_final_cost - b.total_final_cost;
+    });
+  }
+
+  let scheduleInactiveZones: OrderRouteCostComparisonResponse["schedule_inactive_zones"] =
+    [];
+  if (
+    orderRow.sender_lat != null &&
+    orderRow.sender_lng != null &&
+    orderRow.destination_lat != null &&
+    orderRow.destination_lng != null
+  ) {
+    try {
+      const preview = await previewOrderZoneConnectionsByCoordinates({
+        source_lat: orderRow.sender_lat,
+        source_lng: orderRow.sender_lng,
+        destination_lat: orderRow.destination_lat,
+        destination_lng: orderRow.destination_lng,
+        source_name: orderRow.source_name,
+        source_address: orderRow.sender_address,
+        destination_name: orderRow.receiver_name,
+        destination_address: orderRow.destination_address,
+        max_depth: DEFAULT_PREVIEW_MAX_DEPTH,
+        schedule_at: orderRow.route_schedule_at ?? undefined,
+      });
+      scheduleInactiveZones = preview.schedule_inactive_zones ?? [];
+    } catch {
+      scheduleInactiveZones = [];
+    }
+  }
+
   const dims =
     orderRow.package_length != null &&
     orderRow.package_width != null &&
@@ -1757,6 +1804,8 @@ async function buildOrderRouteComparison(
     order_id: orderId,
     currency,
     booking_fee_rate: bookingFeeRate,
+    pff_factor: pffFactor,
+    is_pff_order: isPff,
     package_type: orderRow.package_type,
     packages: orderRow.packages,
     package_factor: orderRow.package_factor,
@@ -1765,19 +1814,28 @@ async function buildOrderRouteComparison(
     routes,
     route_locked: lockInfo.locked,
     route_lock_reason: lockInfo.reason,
+    schedule_inactive_zones: scheduleInactiveZones,
+    route_schedule_at: orderRow.route_schedule_at ?? null,
   };
 }
 
 export async function recalculateRouteCostsForOrder(
   orderId: number,
   ctx: OrderContext,
+  scheduleAt?: string | null
 ): Promise<OrderRouteCostComparisonResponse> {
-  const order = await getOrderForCostAccess(orderId, ctx);
+  let order = await getOrderForCostAccess(orderId, ctx);
   if (order.tracking_status === "AWAITING_CONNECT") {
     throw new RouteCostError(
       "Sender must connect this shipment request before routes can be calculated",
       400,
     );
+  }
+  if (order.tracking_status === "REJECTED") {
+    throw new RouteCostError("This shipment request was rejected", 400);
+  }
+  if (scheduleAt !== undefined) {
+    order = await updateOrderRouteSchedule(orderId, scheduleAt, ctx);
   }
   const lockInfo = await getOrderRouteLockInfo(order.id);
 

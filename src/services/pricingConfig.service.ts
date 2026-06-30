@@ -9,7 +9,7 @@ import { DEFAULT_BOOKING_FEE_RATE, DEFAULT_LAND_SPEED_KMH } from "../models/pric
 import { getLandDistanceProvider } from "./roadRouting.service";
 import { isExternalQuoteConfigured } from "./externalQuote.service";
 
-type Cache = { bookingFeeRate: number; landSpeedKmh: number; loadedAt: number };
+type Cache = { bookingFeeRate: number; landSpeedKmh: number; pffFactor: number; loadedAt: number };
 const CACHE_TTL_MS = 60_000;
 let cache: Cache | null = null;
 
@@ -56,12 +56,15 @@ async function loadCache(): Promise<Cache> {
 
   const bookingFromDb = parseRate(await readSetting(PRICING_SETTING_KEYS.booking_fee_rate));
   const landFromDb = parsePositive(await readSetting(PRICING_SETTING_KEYS.land_speed_kmh));
+  const pffFromDb = parseRate(await readSetting(PRICING_SETTING_KEYS.pff_factor));
   const bookingFromEnv = parseRate(process.env.BOOKING_FEE_RATE);
   const landFromEnv = parsePositive(process.env.LAND_SPEED_KMH);
+  const pffFromEnv = parseRate(process.env.PFF_FACTOR);
 
   cache = {
     bookingFeeRate: bookingFromDb ?? bookingFromEnv ?? DEFAULT_BOOKING_FEE_RATE,
     landSpeedKmh: landFromDb ?? landFromEnv ?? DEFAULT_LAND_SPEED_KMH,
+    pffFactor: pffFromDb ?? pffFromEnv ?? PRICING_DEFAULTS.pff_factor,
     loadedAt: now,
   };
   return cache;
@@ -75,11 +78,16 @@ export async function getLandSpeedKmh(): Promise<number> {
   return (await loadCache()).landSpeedKmh;
 }
 
+export async function getPffFactor(): Promise<number> {
+  return (await loadCache()).pffFactor;
+}
+
 export async function getPricingConfig(): Promise<PricingConfigResponse> {
   const c = await loadCache();
   return {
     booking_fee_rate: c.bookingFeeRate,
     land_speed_kmh: c.landSpeedKmh,
+    pff_factor: c.pffFactor,
     units: PRICING_DEFAULTS.units,
     land_distance_provider: getLandDistanceProvider(),
     external_quote_configured: isExternalQuoteConfigured(),
@@ -100,6 +108,12 @@ export async function updatePricingConfig(
       throw new Error("land_speed_kmh must be greater than 0");
     }
     await writeSetting(PRICING_SETTING_KEYS.land_speed_kmh, String(data.land_speed_kmh));
+  }
+  if (data.pff_factor != null) {
+    if (!Number.isFinite(data.pff_factor) || data.pff_factor < 0 || data.pff_factor > 1) {
+      throw new Error("pff_factor must be between 0 and 1");
+    }
+    await writeSetting(PRICING_SETTING_KEYS.pff_factor, String(data.pff_factor));
   }
   clearPricingConfigCache();
   return getPricingConfig();

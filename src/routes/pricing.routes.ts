@@ -24,6 +24,7 @@ pricingRouter.use(requireAuth);
 const updateSchema = z.object({
   booking_fee_rate: z.number().min(0).max(1).optional(),
   land_speed_kmh: z.number().positive().max(1_000_000).optional(),
+  pff_factor: z.number().min(0).max(1).optional(),
 });
 
 pricingRouter.get("/config", async (_req: AuthenticatedRequest, res: Response) => {
@@ -46,7 +47,11 @@ pricingRouter.patch("/config", async (req: AuthenticatedRequest, res: Response) 
       details: parsed.error.flatten().fieldErrors,
     });
   }
-  if (parsed.data.booking_fee_rate == null && parsed.data.land_speed_kmh == null) {
+  if (
+    parsed.data.booking_fee_rate == null &&
+    parsed.data.land_speed_kmh == null &&
+    parsed.data.pff_factor == null
+  ) {
     return res.status(400).json({ error: "Provide at least one setting to update" });
   }
   try {

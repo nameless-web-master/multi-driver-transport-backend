@@ -15,7 +15,9 @@ import {
   createOrderByReceiver,
   getOrderById,
   listOrders,
+  rejectOrderAsSender,
   updateOrderPackage,
+  updateOrderRouteSchedule,
   updateOrderStatus,
 } from "../services/order.service";
 import {
@@ -261,8 +263,12 @@ ordersRouter.post("/:id/recalculate-costs", async (req: AuthenticatedRequest, re
   if (c.role !== "sender" && c.role !== "receiver" && c.role !== "admin" && c.role !== "driver") {
     return res.status(403).json({ error: "Forbidden" });
   }
+  const scheduleAt =
+    req.body && typeof req.body === "object" && "schedule_at" in req.body
+      ? (req.body.schedule_at as string | null)
+      : undefined;
   try {
-    const comparison = await recalculateRouteCostsForOrder(id, c);
+    const comparison = await recalculateRouteCostsForOrder(id, c, scheduleAt);
     res.json(comparison);
   } catch (err) {
     handle(res, err);
@@ -306,6 +312,51 @@ ordersRouter.post("/:id/connect", async (req: AuthenticatedRequest, res: Respons
     const order = await getOrderById(id, c);
     if (!order) return res.status(404).json({ error: "Order not found" });
     res.json({ ...order, route_recalc_warning: routeRecalcWarning });
+  } catch (err) {
+    handle(res, err);
+  }
+});
+
+ordersRouter.post("/:id/reject", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  const reason =
+    req.body && typeof req.body === "object" && typeof req.body.reason === "string"
+      ? req.body.reason
+      : undefined;
+  try {
+    const order = await rejectOrderAsSender(id, ctx(req), reason);
+    res.json(order);
+  } catch (err) {
+    handle(res, err);
+  }
+});
+
+ordersRouter.patch("/:id/route-schedule", async (req: AuthenticatedRequest, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(400).json({ error: "Invalid order id" });
+  }
+  const parsed = z
+    .object({
+      schedule_at: z.string().nullable().optional(),
+    })
+    .safeParse(req.body ?? {});
+  if (!parsed.success) {
+    return res.status(400).json({
+      error: "Validation failed",
+      details: parsed.error.flatten().fieldErrors,
+    });
+  }
+  try {
+    const order = await updateOrderRouteSchedule(
+      id,
+      parsed.data.schedule_at ?? null,
+      ctx(req)
+    );
+    res.json(order);
   } catch (err) {
     handle(res, err);
   }

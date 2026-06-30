@@ -129,10 +129,20 @@ export interface RouteCostSummaryResponse {
   segments: RouteSegmentCostResponse[];
 }
 
+export interface ScheduleInactiveZoneSummary {
+  zone_id: number;
+  zone_name: string;
+  transport_name: string;
+  schedule_summary: string | null;
+  covers: "pickup" | "destination" | "both";
+}
+
 export interface OrderRouteCostComparisonResponse {
   order_id: number;
   currency: string;
   booking_fee_rate: number;
+  pff_factor: number;
+  is_pff_order: boolean;
   package_type: string | null;
   packages: OrderPackageEntry[];
   package_factor: number | null;
@@ -141,6 +151,8 @@ export interface OrderRouteCostComparisonResponse {
   routes: RouteCostSummaryResponse[];
   route_locked: boolean;
   route_lock_reason: "confirmed_route" | "delivery_in_progress" | null;
+  schedule_inactive_zones: ScheduleInactiveZoneSummary[];
+  route_schedule_at: string | null;
 }
 
 export interface AffectedRouteRef {

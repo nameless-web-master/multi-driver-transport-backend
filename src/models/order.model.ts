@@ -43,6 +43,7 @@ export interface OrderRow {
   status: OrderStatus;
   tracking_status: import("./orderTracking.model").TrackingStatus;
   pickup_ready_at: Date | null;
+  route_schedule_at: Date | null;
   submitted_at: Date;
   delivering_at: Date | null;
   received_at: Date | null;
@@ -89,6 +90,7 @@ export interface OrderResponse {
   status: OrderStatus;
   tracking_status: import("./orderTracking.model").TrackingStatus;
   pickup_ready_at: string | null;
+  route_schedule_at?: string | null;
   /** Milestone 6/7 — populated on list/detail when a route has been selected. */
   route_selection_status?: import("./routeConfirmation.model").RouteSelectionStatus | null;
   selected_route_id?: number | null;

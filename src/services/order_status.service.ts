@@ -7,6 +7,7 @@ import {
   TRACKING_STATUSES,
 } from "../models/orderTracking.model";
 import { getOrderById, syncLegacyOrderStatus, type OrderContext } from "./order.service";
+import { isPffPaymentMethod } from "../utils/paymentFlow";
 import { notifyOrderParticipants } from "./notification.service";
 import { syncOrderTrackingFromSegments } from "./segment_tracking.service";
 
@@ -20,6 +21,7 @@ export class OrderStatusError extends Error {
 
 const TRANSITIONS: Record<TrackingStatus, TrackingStatus[]> = {
   AWAITING_CONNECT: [],
+  REJECTED: [],
   CONFIRMED: ["PICKUP_AVAILABLE"],
   PICKUP_AVAILABLE: ["PICKED_UP"],
   PICKED_UP: ["IN_TRANSIT"],
@@ -175,7 +177,18 @@ export async function updateOrderStatus(
     : null;
 
   if (status === "PICKUP_AVAILABLE") {
-    if (ctx.role !== "sender" && ctx.role !== "admin") {
+    const isPff = isPffPaymentMethod(order.payment_method);
+    if (isPff) {
+      if (ctx.role !== "receiver" && ctx.role !== "admin") {
+        throw new OrderStatusError(
+          "Only the receiver can mark pickup available for PFF (Advanced Payment) orders",
+          403
+        );
+      }
+      if (ctx.role === "receiver" && order.receiver_user_id !== ctx.userId) {
+        throw new OrderStatusError("Forbidden", 403);
+      }
+    } else if (ctx.role !== "sender" && ctx.role !== "admin") {
       throw new OrderStatusError("Only the sender can mark pickup as ready", 403);
     }
     if (pickupReadyAt) {
@@ -196,8 +209,10 @@ export async function updateOrderStatus(
     void notifyOrderParticipants({
       order_id: orderId,
       type: "pickup_ready",
-      title: "Pickup ready",
-      body: `Shipment #${orderId} is ready for pickup. Transporters on the route can begin collection.`,
+      title: isPff ? "PFF pickup available" : "Pickup ready",
+      body: isPff
+        ? `Shipment #${orderId}: receiver marked pickup available. Producer — prepare payment package (cheque/cash) for the delivering transporter. Transporters may begin collection.`
+        : `Shipment #${orderId} is ready for pickup. Transporters on the route can begin collection.`,
       exclude_user_id: ctx.userId,
     }).catch((err) => console.error("[notifications] pickup_ready failed:", err));
 

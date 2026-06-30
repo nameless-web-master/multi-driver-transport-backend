@@ -7,6 +7,7 @@ import type {
 } from "../models/zoneConnection.model";
 import {
   buildZoneScheduleFields,
+  formatZoneScheduleSummary,
   isZoneScheduleActive,
   parseScheduleFromRow,
 } from "./zoneSchedule.service";
@@ -97,6 +98,8 @@ export interface OrderDraftPreviewInput {
    * `DEFAULT_EXTRA_HOPS`. Clamped to 0..6.
    */
   extra_hops?: number;
+  /** ISO datetime for schedule-aware route preview (defaults to now). */
+  schedule_at?: string;
 }
 
 export interface OrderDraftZoneSummary {
@@ -225,6 +228,16 @@ export interface OrderDraftPreview {
    * no covering zone at all.
    */
   gap: OrderDraftGap | null;
+  /** Zones covering pickup/destination that exist but are outside their operating window. */
+  schedule_inactive_zones: ScheduleInactiveZone[];
+}
+
+export interface ScheduleInactiveZone {
+  zone_id: number;
+  zone_name: string;
+  transport_name: string;
+  schedule_summary: string | null;
+  covers: "pickup" | "destination" | "both";
 }
 
 // --------------------------------------------------------------------------
@@ -325,7 +338,66 @@ function parsePairsJsonb(raw: unknown): AdjacentCellPair[] {
   return [];
 }
 
-async function loadZoneMeta(): Promise<ZoneMeta[]> {
+function mapRowToZoneMeta(row: Record<string, unknown>): ZoneMeta {
+  const schedule = parseScheduleFromRow(row);
+  return {
+    id: Number(row.id),
+    zone_name: String(row.zone_name ?? ""),
+    owner_user_id: Number(row.owner_user_id),
+    transport_name: String(row.transport_name ?? ""),
+    transport_mode: row.transport_mode == null ? null : String(row.transport_mode),
+    resolution: Number(row.resolution ?? 0),
+    cell_count: Number(row.cell_count ?? 0),
+    departure_hub: parseOrderHub(row, "departure_hub"),
+    arrival_hub: parseOrderHub(row, "arrival_hub"),
+    departure_time: schedule.departure_time,
+    arrival_time: schedule.arrival_time,
+    operation_date: schedule.operation_date,
+    operation_start_date: schedule.operation_start_date,
+    operation_end_date: schedule.operation_end_date,
+    schedule_pattern: schedule.schedule_pattern,
+    weekday_start: schedule.weekday_start,
+    weekday_end: schedule.weekday_end,
+    month_day_start: schedule.month_day_start,
+    month_day_end: schedule.month_day_end,
+    operating_start_time: schedule.operating_start_time,
+    operating_end_time: schedule.operating_end_time,
+    base_fee: row.base_fee == null ? null : Number(row.base_fee),
+    cost_per_km: row.cost_per_km == null ? null : Number(row.cost_per_km),
+    cost_per_hour: row.cost_per_hour == null ? null : Number(row.cost_per_hour),
+    currency: row.currency == null ? "USD" : String(row.currency),
+    trust_payment_forwarder: Boolean(row.trust_payment_forwarder),
+    driver_trustworthiness: Number(row.driver_trustworthiness ?? 0),
+  };
+}
+
+function zoneMetaScheduleFields(z: ZoneMeta) {
+  return buildZoneScheduleFields({
+    transport_mode: z.transport_mode ?? "land",
+    operation_date: z.operation_date,
+    operation_start_date: z.operation_start_date,
+    operation_end_date: z.operation_end_date,
+    schedule_pattern: z.schedule_pattern,
+    weekday_start: z.weekday_start,
+    weekday_end: z.weekday_end,
+    month_day_start: z.month_day_start,
+    month_day_end: z.month_day_end,
+    operating_start_time: z.operating_start_time,
+    operating_end_time: z.operating_end_time,
+    departure_time: z.departure_time,
+    arrival_time: z.arrival_time,
+  });
+}
+
+function resolveScheduleAt(iso: string | null | undefined): Date {
+  if (iso?.trim()) {
+    const d = new Date(iso);
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+  return new Date();
+}
+
+async function loadAllAvailableZoneMeta(): Promise<ZoneMeta[]> {
   // Note: `h3_cells` is intentionally NOT selected here — see ZoneMeta doc.
   const result = await pool.query(
     `SELECT z.id,
@@ -349,60 +421,46 @@ async function loadZoneMeta(): Promise<ZoneMeta[]> {
      JOIN users u ON u.id = z.owner_user_id
      WHERE z.available = TRUE`
   );
+  return result.rows.map((row) => mapRowToZoneMeta(row));
+}
+
+async function loadZoneMeta(): Promise<ZoneMeta[]> {
   const now = new Date();
-  return result.rows
-    .map((row) => {
-      const schedule = parseScheduleFromRow(row);
-      return {
-        id: Number(row.id),
-        zone_name: String(row.zone_name ?? ""),
-        owner_user_id: Number(row.owner_user_id),
-        transport_name: String(row.transport_name ?? ""),
-        transport_mode: row.transport_mode == null ? null : String(row.transport_mode),
-        resolution: Number(row.resolution ?? 0),
-        cell_count: Number(row.cell_count ?? 0),
-        departure_hub: parseOrderHub(row, "departure_hub"),
-        arrival_hub: parseOrderHub(row, "arrival_hub"),
-        departure_time: schedule.departure_time,
-        arrival_time: schedule.arrival_time,
-        operation_date: schedule.operation_date,
-        operation_start_date: schedule.operation_start_date,
-        operation_end_date: schedule.operation_end_date,
-        schedule_pattern: schedule.schedule_pattern,
-        weekday_start: schedule.weekday_start,
-        weekday_end: schedule.weekday_end,
-        month_day_start: schedule.month_day_start,
-        month_day_end: schedule.month_day_end,
-        operating_start_time: schedule.operating_start_time,
-        operating_end_time: schedule.operating_end_time,
-        base_fee: row.base_fee == null ? null : Number(row.base_fee),
-        cost_per_km: row.cost_per_km == null ? null : Number(row.cost_per_km),
-        cost_per_hour: row.cost_per_hour == null ? null : Number(row.cost_per_hour),
-        currency: row.currency == null ? "USD" : String(row.currency),
-        trust_payment_forwarder: Boolean(row.trust_payment_forwarder),
-        driver_trustworthiness: Number(row.driver_trustworthiness ?? 0),
-      };
-    })
-    .filter((z) =>
-      isZoneScheduleActive(
-        buildZoneScheduleFields({
-          transport_mode: z.transport_mode ?? "land",
-          operation_date: z.operation_date,
-          operation_start_date: z.operation_start_date,
-          operation_end_date: z.operation_end_date,
-          schedule_pattern: z.schedule_pattern,
-          weekday_start: z.weekday_start,
-          weekday_end: z.weekday_end,
-          month_day_start: z.month_day_start,
-          month_day_end: z.month_day_end,
-          operating_start_time: z.operating_start_time,
-          operating_end_time: z.operating_end_time,
-          departure_time: z.departure_time,
-          arrival_time: z.arrival_time,
-        }),
-        now
-      )
-    );
+  const all = await loadAllAvailableZoneMeta();
+  return all.filter((z) => isZoneScheduleActive(zoneMetaScheduleFields(z), now));
+}
+
+function buildScheduleInactiveZones(
+  pickupIdsRaw: Set<number>,
+  destIdsRaw: Set<number>,
+  activeZoneIds: Set<number>,
+  allZonesById: Map<number, ZoneMeta>
+): ScheduleInactiveZone[] {
+  const items: ScheduleInactiveZone[] = [];
+  const seen = new Set<number>();
+
+  function add(id: number, covers: ScheduleInactiveZone["covers"]) {
+    if (activeZoneIds.has(id) || seen.has(id)) return;
+    const z = allZonesById.get(id);
+    if (!z) return;
+    seen.add(id);
+    items.push({
+      zone_id: z.id,
+      zone_name: z.zone_name,
+      transport_name: z.transport_name,
+      schedule_summary: formatZoneScheduleSummary(zoneMetaScheduleFields(z)),
+      covers,
+    });
+  }
+
+  for (const id of pickupIdsRaw) {
+    add(id, destIdsRaw.has(id) ? "both" : "pickup");
+  }
+  for (const id of destIdsRaw) {
+    add(id, pickupIdsRaw.has(id) ? "both" : "destination");
+  }
+
+  return items.sort((a, b) => a.transport_name.localeCompare(b.transport_name));
 }
 
 /**
@@ -1014,14 +1072,24 @@ export async function previewOrderZoneConnectionsByCoordinates(
   // Run zone-meta load, connection load, and the two SQL covering checks in
   // parallel — none of them depend on each other and each is a single
   // round-trip, so wall-time should be dominated by the slowest.
-  const [zones, allConnections, pickupIdsRaw, destIdsRaw] = await Promise.all([
-    loadZoneMeta(),
+  const [allZones, allConnections, pickupIdsRaw, destIdsRaw] = await Promise.all([
+    loadAllAvailableZoneMeta(),
     loadConnections(),
     findCoveringZoneIdsSql(input.source_lat, input.source_lng),
     findCoveringZoneIdsSql(input.destination_lat, input.destination_lng),
   ]);
 
+  const now = resolveScheduleAt(input.schedule_at);
+  const zones = allZones.filter((z) => isZoneScheduleActive(zoneMetaScheduleFields(z), now));
+  const allZonesById = new Map(allZones.map((z) => [z.id, z]));
   const activeZoneIds = new Set(zones.map((z) => z.id));
+  const scheduleInactiveZones = buildScheduleInactiveZones(
+    pickupIdsRaw,
+    destIdsRaw,
+    activeZoneIds,
+    allZonesById
+  );
+
   const pickupIds = new Set([...pickupIdsRaw].filter((id) => activeZoneIds.has(id)));
   const destIds = new Set([...destIdsRaw].filter((id) => activeZoneIds.has(id)));
 
@@ -1178,6 +1246,7 @@ export async function previewOrderZoneConnectionsByCoordinates(
     message,
     possible_connection_chains: chains,
     gap,
+    schedule_inactive_zones: scheduleInactiveZones,
   };
 }
 
@@ -1213,5 +1282,6 @@ export async function previewOrderZoneConnectionsForOrder(
     destination_name: order.receiver_name,
     destination_address: order.destination_address,
     max_depth: DEFAULT_PREVIEW_MAX_DEPTH,
+    schedule_at: order.route_schedule_at ?? undefined,
   });
 }
