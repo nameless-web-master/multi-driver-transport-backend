@@ -1604,9 +1604,11 @@ async function applyQuotedSegmentCost(
     orderId,
     transporterId,
     pricedZoneId,
+    ["requested", "missing", "calculated", "manual"],
   );
   const siblingIds = siblings.map((s) => Number(s.id));
-  if (siblingIds.length === 0) {
+  const idsToUpdate = siblingIds.length > 0 ? siblingIds : [segmentCostId];
+  if (idsToUpdate.length === 0) {
     throw new RouteCostError("Segment cost not found", 404);
   }
 
@@ -1614,10 +1616,14 @@ async function applyQuotedSegmentCost(
     `UPDATE route_segment_costs
      SET manual_cost = $2, final_cost = $2, cost_status = 'manual', cost_source = $3, updated_at = NOW()
      WHERE id = ANY($1::int[])`,
-    [siblingIds, quotedCost, source],
+    [idsToUpdate, quotedCost, source],
   );
 
-  await recalculateRouteSummaries(siblings.map((s) => Number(s.route_id)));
+  await recalculateRouteSummaries(
+    siblings.length > 0
+      ? siblings.map((s) => Number(s.route_id))
+      : [Number(seg.route_id)],
+  );
 
   const zoneIdsQuoted = parseJsonIntArray(seg.zone_ids);
   const zoneMeta = await loadZoneMetaForIds(zoneIdsQuoted);
